@@ -10,6 +10,7 @@ import glob
 import logging
 import subprocess
 import sys
+import time
 from typing import Dict, Set, Optional, Callable, List
 
 from .utils import (
@@ -39,6 +40,8 @@ class DependencyManager:
         pre_resolve_hook: Optional callback called before dependency resolution
         post_resolve_hook: Optional callback called after dependency resolution
         install_hook: Optional callback for custom package installation logic
+        install_timeout: Timeout in seconds for each pip install attempt (default: 60)
+        max_retries: Maximum number of retry attempts for failed package batches (default: 5)
     """
 
     def __init__(
@@ -47,7 +50,9 @@ class DependencyManager:
         logger: Optional[logging.Logger] = None,
         pre_resolve_hook: Optional[Callable[[str, str], None]] = None,
         post_resolve_hook: Optional[Callable[[str, Dict[str, str]], None]] = None,
-        install_hook: Optional[Callable[[Dict[str, str], Set[str]], bool]] = None
+        install_hook: Optional[Callable[[Dict[str, str], Set[str]], bool]] = None,
+        install_timeout: int = 60,
+        max_retries: int = 5
     ):
         """Initialize the dependency manager with configurable paths and hooks."""
         self.cache_dir = os.path.abspath(cache_dir or ".dependency_cache")
@@ -58,6 +63,8 @@ class DependencyManager:
         self.pre_resolve_hook = pre_resolve_hook
         self.post_resolve_hook = post_resolve_hook
         self.install_hook = install_hook
+        self.install_timeout = install_timeout
+        self.max_retries = max_retries
 
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -238,22 +245,43 @@ class DependencyManager:
             self.logger.info(f"Installing {len(packages_to_install)} missing packages...")
             for package_name in packages_to_install:
                 self.logger.info(f"     ✓ {package_name}")
-            try:
-                batch_size = 50
-                for i in range(0, len(packages_to_install), batch_size):
-                    batch = packages_to_install[i:i + batch_size]
-                    result = subprocess.run([
-                        sys.executable, '-m', 'pip', 'install', '--quiet'
-                    ] + batch, capture_output=True, text=True, timeout=300)
+            batch_size = 50
+            for i in range(0, len(packages_to_install), batch_size):
+                batch = packages_to_install[i:i + batch_size]
+                last_error = None
+                for attempt in range(1, self.max_retries + 1):
+                    try:
+                        result = subprocess.run([
+                            sys.executable, '-m', 'pip', 'install', '--quiet'
+                        ] + batch, capture_output=True, text=True, timeout=self.install_timeout)
 
-                    if result.returncode != 0:
-                        self.logger.error(f"Failed to install package batch: {result.stderr}")
-                        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+                        if result.returncode != 0:
+                            raise subprocess.CalledProcessError(
+                                result.returncode, result.args, result.stdout, result.stderr
+                            )
+                        last_error = None
+                        break
+                    except subprocess.TimeoutExpired:
+                        last_error = f"timed out after {self.install_timeout}s"
+                        self.logger.warning(
+                            f"pip install attempt {attempt}/{self.max_retries} timed out for {len(batch)} packages"
+                        )
+                    except subprocess.CalledProcessError as e:
+                        last_error = e.stderr or "unknown error"
+                        self.logger.warning(
+                            f"pip install attempt {attempt}/{self.max_retries} failed for {len(batch)} packages"
+                        )
 
-                self.logger.info("Package installation completed successfully")
-            except subprocess.TimeoutExpired:
-                self.logger.error("Package installation timed out")
-                raise
+                    if attempt < self.max_retries:
+                        backoff = min(2 ** (attempt - 1), 30)
+                        self.logger.info(f"Retrying in {backoff}s...")
+                        time.sleep(backoff)
+
+                if last_error:
+                    self.logger.error(f"Failed to install package batch after {self.max_retries} attempts: {last_error}")
+                    raise subprocess.CalledProcessError(1, [], None, last_error)
+
+            self.logger.info("Package installation completed successfully")
         else:
             self.logger.info("All required packages are already installed")
 

@@ -50,6 +50,8 @@ class Config:
     pre_resolve_hook: Optional[Callable[[str, str], None]] = None
     post_resolve_hook: Optional[Callable[[str, Dict[str, str]], None]] = None
     install_hook: Optional[Callable[[Dict[str, str], Set[str]], bool]] = None
+    install_timeout: int = 60
+    max_retries: int = 5
 
     def create_manager(self) -> DependencyManager:
         """Create a DependencyManager with this configuration."""
@@ -58,7 +60,9 @@ class Config:
             logger=self.logger,
             pre_resolve_hook=self.pre_resolve_hook,
             post_resolve_hook=self.post_resolve_hook,
-            install_hook=self.install_hook
+            install_hook=self.install_hook,
+            install_timeout=self.install_timeout,
+            max_retries=self.max_retries
         )
 
 

@@ -26,10 +26,13 @@ def cmd_install(args):
     """Install packages with dependency resolution."""
     setup_logging(args.verbose)
 
-    dm = DependencyManager(cache_dir=args.cache_dir)
+    dm = DependencyManager(
+        cache_dir=args.cache_dir,
+        install_timeout=args.timeout,
+        max_retries=args.max_retries
+    )
 
     if args.requirements:
-        # Install from requirements file
         print(f"Installing from {args.requirements}...")
         requirements = {args.requirements: Path(args.requirements).read_text()}
         asyncio.run(dm.resolve_dependencies(requirements))
@@ -48,7 +51,11 @@ def cmd_resolve(args):
     """Resolve dependencies without installing."""
     setup_logging(args.verbose)
 
-    dm = DependencyManager(cache_dir=args.cache_dir)
+    dm = DependencyManager(
+        cache_dir=args.cache_dir,
+        install_timeout=args.timeout,
+        max_retries=args.max_retries
+    )
 
     if args.requirements:
         requirements = {args.requirements: Path(args.requirements).read_text()}
@@ -122,7 +129,6 @@ def cmd_check(args):
                 # For now, just check presence
                 pass
 
-    # Check for packages installed but not in cache (optional warning)
     cached_canonical_names = set()
     for package_name in resolved_packages.keys():
         base_name = package_name.split('[')[0] if '[' in package_name else package_name
@@ -130,7 +136,6 @@ def cmd_check(args):
 
     for installed_name in installed_packages:
         if installed_name not in cached_canonical_names:
-            # Only warn about non-standard packages if requested
             if args.all:
                 extra_packages.append(installed_name)
 
@@ -173,7 +178,6 @@ def cmd_outdated(args):
         import subprocess
         import sys
 
-        # Use pip list --outdated to get outdated packages
         result = subprocess.run([
             sys.executable, '-m', 'pip', 'list', '--outdated', '--format=json'
         ], capture_output=True, text=True, timeout=60)
@@ -218,10 +222,13 @@ def cmd_upgrade(args):
     """Upgrade packages to their latest versions."""
     setup_logging(args.verbose)
 
-    dm = DependencyManager(cache_dir=args.cache_dir)
+    dm = DependencyManager(
+        cache_dir=args.cache_dir,
+        install_timeout=args.timeout,
+        max_retries=args.max_retries
+    )
 
     if args.requirements:
-        # Upgrade from requirements file
         print(f"Upgrading from {args.requirements}...")
         requirements = {args.requirements: Path(args.requirements).read_text()}
         asyncio.run(dm.upgrade_dependencies(requirements))
@@ -271,6 +278,21 @@ def create_parser():
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging"
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=60,
+        help="Timeout in seconds for each pip install attempt (default: 60)"
+    )
+
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Maximum retry attempts for failed package installs (default: 5)"
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
