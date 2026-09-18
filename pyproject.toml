@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chacc-dependency-manager"
-version = "1.2.1"
+version = "1.3.0"
 description = "Pip accelerator package. Intelligent, incremental dependency resolution and caching for pip environment based applications. It it meant to complement pip"
 authors = [
     {name = "Jonas G Mwambimbi", email = "jonasgeorge1015@gmail.com"}

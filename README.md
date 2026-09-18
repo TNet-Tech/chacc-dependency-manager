@@ -65,6 +65,11 @@ You can also install specific packages directly:
 cdm install fastapi uvicorn
 ```
 
+Global options can be passed before the subcommand:
+```bash
+cdm --timeout 120 --max-retries 10 install
+```
+
 ## Usage Guide
 
 ChaCC Dependency Manager can be used from the command line or programmatically in your Python code.
@@ -306,6 +311,8 @@ class Config:
     pre_resolve_hook: Optional[Callable] = None
     post_resolve_hook: Optional[Callable] = None
     install_hook: Optional[Callable] = None
+    install_timeout: int = 60
+    max_retries: int = 5
 ```
 
 #### `DependencyManager` Class
@@ -313,11 +320,55 @@ The core class that manages dependency resolution.
 
 ```python
 class DependencyManager:
+    def __init__(
+        self,
+        cache_dir: Optional[str] = None,
+        logger: Optional[logging.Logger] = None,
+        pre_resolve_hook: Optional[Callable] = None,
+        post_resolve_hook: Optional[Callable] = None,
+        install_hook: Optional[Callable] = None,
+        install_timeout: int = 60,
+        max_retries: int = 5
+    )
+```
+
+```python
+class DependencyManager:
     async def resolve_dependencies(self, ...): ...
     async def upgrade_dependencies(self, ...): ...
     def invalidate_cache(self): ...
     def invalidate_module_cache(self, module_name: str): ...
+    def install_missing_packages(self, resolved_packages, installed_packages): ...
 ```
+
+## Recent Updates (v1.3.0)
+
+This release adds robust retry logic and configurable timeouts for package installation, ensuring transient network failures do not abort the entire installation process.
+
+### Installation Retry and Timeout
+
+Package installation now retries failed pip install attempts with exponential backoff:
+
+- **Default timeout**: 60 seconds per pip install attempt
+- **Default retries**: 5 attempts per package batch
+- **Backoff**: Exponential (1s, 2s, 4s, 8s, 16s, capped at 30s)
+
+Configure via CLI:
+```bash
+cdm install --timeout 120 --max-retries 10
+```
+
+Or programmatically via the Config object or DependencyManager constructor:
+```python
+# Via Config
+config = Config(install_timeout=120, max_retries=10)
+asyncio.run(re_resolve_dependencies(config=config))
+
+# Via DependencyManager
+dm = DependencyManager(install_timeout=120, max_retries=10)
+```
+
+The resolution phase (`piptools compile`) runs without a timeout. Only the pip install phase uses the configurable timeout and retry logic.
 
 ## Recent Updates (v1.2.0)
 
