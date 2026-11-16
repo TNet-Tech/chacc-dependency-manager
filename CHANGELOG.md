@@ -7,9 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.4.0] - 2026-11-12
 
-This release fixes how packages are resolved, cached and installed. **Upgrading clears every existing
-cache once**, because the environment hash changed (see below). The first run after upgrading does a
-full resolve.
+This release fixes how packages are resolved, cached and installed. **The first run after upgrading
+does one full resolve**, because the environment hash changed (see below).
 
 The 1.3.0 public API and CLI still work unchanged: every export, method, parameter and flag still exists
 with the same order, and no new parameter is required. The behavior changes to plan for:
@@ -38,6 +37,8 @@ with the same order, and no new parameter is required. The behavior changes to p
     logged as warnings
   - unchanged modules reuse their cached package set, so only new or changed modules are resolved
     again when a conflict happens
+- `log_level` option on `DependencyManager` and `Config` (`"INFO"`, `logging.WARNING`, ...). It sets the
+  level of the passed `logger`, or of ChaCC's built-in logger. Not passing it keeps the previous behavior.
 - `on_conflict` option on `DependencyManager` and `Config`, plus `--on-conflict {resolve,fail}`.
   `"fail"` raises `ResolutionError` listing each conflicting package with the module and version on each side
 - `DependencyManager.remove_module()` / `chacc.remove_module()` / `cdm cache --remove --module NAME` to
@@ -53,10 +54,12 @@ with the same order, and no new parameter is required. The behavior changes to p
   (default 600s, `0` disables it)
 - `resolve_dependencies_sync()` and `upgrade_dependencies_sync()` blocking methods for scripts and CLIs
 - `install=` parameter on `resolve_dependencies()` / `resolve_dependencies_sync()`
+- `dry_run=` parameter on `resolve_dependencies()` / `resolve_dependencies_sync()`: resolves and returns
+  the pins without saving the cache, registering the modules or installing
 - `cdm resolve --install`: prints the resolved pins, then installs what's missing or at the wrong version
   (the 1.3.0 behavior of `cdm resolve`, plus the printed list)
-- `-p/--pattern` and `--search-dirs` on `cdm install`, so auto-discovery options no longer require
-  `cdm resolve`
+- `-p/--pattern` and `--search-dirs` on `cdm install` and `cdm upgrade`, so auto-discovery options no
+  longer require `cdm resolve`
 - `no_deps=` parameter on `install_missing_packages()`
 - `chacc.utils` helpers: `merge_with_version_policy()`, `format_conflict()`, `major_version_key()`,
   `version_satisfies()`, `parse_lock_file()`, `attribute_packages()`
@@ -83,33 +86,47 @@ with the same order, and no new parameter is required. The behavior changes to p
 - **Explicit `modules_requirements` are additive.** Each call adds or updates modules, and modules cached
   by earlier calls stay in the set, so modules can be supplied one at a time. The cache now stores each
   module's requirements so the full set can be rebuilt. Auto-discovered files are the full set of
-  discovered modules: a deleted file counts as removed, and explicitly added modules are kept.
+  discovered modules: a deleted file counts as removed, and explicitly added modules are kept. When
+  discovery finds no file at all (for example when run from the wrong folder), no module is dropped
+  and the registered modules are resolved and installed.
+- A change of Python version, OS or architecture re-resolves every registered module from scratch, but
+  keeps the modules registered. It used to wipe the whole cache, which would have forgotten modules
+  registered one call at a time.
 - `invalidate_module_cache()` / `cdm cache --clear --module` now force a re-resolve and keep the module
   registered. Use `remove_module()` / `--remove` to drop it.
-- `upgrade_dependencies()` / `cdm upgrade` with no arguments upgrades every registered module. Called
+- `upgrade_dependencies()` / `cdm upgrade` with no arguments upgrades every registered module, including
+  modules discovered earlier with other `-p`/`--search-dirs` options, and adds any newly discovered
+  files. Upgrading never unregisters a module. Called
   with modules (`cdm upgrade -r FILE`, `cdm upgrade PKG...`), it upgrades only those modules' packages
   (pip-compile `--upgrade-package`), and every other module keeps its pins.
-- The concurrency lock is shared by every `DependencyManager` that uses the same cache directory (for
-  example managers created through `Config`), not just one instance
+- Work on a cache directory is serialised across threads and processes: every `DependencyManager` using
+  the directory (for example managers created through `Config`) shares one lock, and an OS file lock on
+  `<cache_dir>/.lock` makes other processes (server workers, parallel CI jobs) wait their turn. If the file
+  system doesn't support locking, a warning is logged and only threads are coordinated.
 - Hooks run in a worker thread when the async methods are used
 - Each module's cache entry stores its requirements, registration order and source (explicit or
   discovered). Its `packages` lists everything the module pulls in, directly or through dependencies.
   That list comes from pip-compile's `# via` annotations, or from the module's own resolution after a
   conflict.
-- `cdm install -r FILE` / `cdm upgrade -r FILE` / `cdm resolve -r FILE` register the file under its name
-  without the extension, the same name auto-discovery uses. They used to use the path as given, so the
-  same file could end up registered twice.
+- `cdm install -r FILE` / `cdm upgrade -r FILE` register the file as a module named after it. A file in
+  the current directory gets its name without the extension (`requirements`), the same name
+  auto-discovery uses; a file elsewhere keeps its folder (`api/requirements`). They used to use the path
+  as given, so the same file could end up registered twice.
+- Auto-discovered files are still named after the file without the extension. When several discovered
+  files share a name (a `requirements.txt` in each service folder), each one is named after its path
+  instead (`services/api/requirements`). 1.3.0 gave them all the same name, so their cache entries
+  overwrote each other.
 - `cdm install PKG...` / `cdm upgrade PKG...` keep the packages as a module named `cli` between runs
 - `resolve_dependencies()`, `upgrade_dependencies()` and `re_resolve_dependencies()` run their pip work
   in a worker thread, and they return the resolved pins. Concurrent calls for the same cache directory
-  run one at a time (within one process).
+  run one at a time, also across processes.
 - Default `install_timeout` raised from 60s back to 300s per pip install attempt (per batch of up to 50
   packages). `--timeout 0` / `install_timeout=None` disables it.
 - `resolve_module_dependencies()` still returns `{}` on failure (and logs the error), as before. The new
   `raise_on_error=True` parameter raises `ResolutionError` instead, so a failure can be told apart from
   "no dependencies".
 - `cdm resolve` is now the dry run its help text always described: it prints the resolved pins and how
-  many packages would be installed or changed, without installing. Scripts that used `cdm resolve` to
+  many packages would be installed or changed, without installing or changing the cache. Scripts that used `cdm resolve` to
   install should use `cdm resolve --install` (or `cdm install`).
 - `cdm check` reports version mismatches and major-version conflicts, not just missing packages
 - `cdm cache --info` lists each module with its package count and skipped packages, plus the conflicts
@@ -118,6 +135,10 @@ with the same order, and no new parameter is required. The behavior changes to p
   cache first.
 - pip-compile runs with `--strip-extras`, so extras' dependencies are pinned as normal packages
 - Resolution errors show pip's actual message without the Python traceback
+- When the package index can't be reached (network or index problem), the error says so and the
+  per-module conflict check is skipped, instead of blaming a module's requirements
+- The `install_hook` type on `Config` and `DependencyManager` is `Callable[[Dict[str, str], Set[str]], bool]`,
+  matching what it has always received (the set of installed package names)
 - pip install output is no longer written to the debug log (only pip's "Successfully installed" line)
 - `merge_resolved_packages()` is kept for backward compatibility but the resolver no longer uses it
 
@@ -144,6 +165,18 @@ with the same order, and no new parameter is required. The behavior changes to p
 - The cache file is written atomically, so a crash mid-write no longer corrupts it
 - `last_updated` holds a real timestamp. It used to hold the parent directory's modification time.
 - `cdm outdated` uses canonical package names when matching
+- Relative paths inside requirements (`-r base.txt`, `-c constraints.txt`, `-e ./lib`, `./lib`) pointed at the
+  wrong place, because the text is resolved from a temporary folder. They are now resolved relative to
+  the requirements file (or the current folder for text passed from Python), as pip does.
+- Editing a file included with `-r` / `-c` didn't trigger a new resolve. Included files now count toward
+  the module's hash.
+- Under the CLI, every log line was printed twice, and debug messages showed without `-v`
+- `cdm demo modules` / `cdm demo cache` described the 1.2 behavior and left a `./demo_cache` folder behind.
+  They now show modules registered one at a time, the conflict policy and the 1.4 cache layout, using a
+  temporary folder.
+- The README bundled inside the package described 1.2.0. It is now a short, current guide that links to
+  the full documentation.
+- `packaging` is declared as a dependency (it was used but only installed through pip-tools)
 - `cdm upgrade PKG` / `cdm upgrade -r FILE` cleared every other module from the cache
 
 ## [1.3.0] - 2026-09-18

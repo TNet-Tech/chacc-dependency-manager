@@ -94,13 +94,16 @@ cdm install fastapi uvicorn sqlalchemy
 cdm install -p "requirements-*.txt" --search-dirs services/api services/worker
 ```
 
-Requirements are remembered between runs. Packages passed on the command line are kept as a module named `cli`, and a `-r` file is registered under its file name without the extension (`requirements-dev`), which is the same name auto-discovery uses. To stop managing them, run `cdm cache --remove --module cli`.
+Requirements are remembered between runs. Packages passed on the command line are kept as a module named `cli`. A `-r` file is registered as a module named after the file: a file in the current directory gets its name without the extension (`requirements-dev`), the same name auto-discovery gives it, and a file elsewhere also keeps its folder (`-r api/requirements.txt` → `api/requirements`), so files with the same name don't replace each other. To stop managing a module, run `cdm cache --remove --module cli`.
 
 #### **Upgrading Dependencies**
 
 ```bash
-# Auto-discover and upgrade all packages in requirements files
+# Upgrade every registered module (plus any newly discovered requirements files)
 cdm upgrade
+
+# Also pick up requirements files elsewhere
+cdm upgrade -p "requirements-*.txt" --search-dirs services/api services/worker
 
 # Add a requirements file, then upgrade
 cdm upgrade -r requirements-dev.txt
@@ -109,7 +112,7 @@ cdm upgrade -r requirements-dev.txt
 cdm upgrade requests fastapi
 ```
 
-With no arguments, `cdm upgrade` upgrades **every registered module** to the newest versions that work together. With `-r FILE` or package names, only those packages are upgraded, and every other module keeps its pinned versions. Both use the same conflict policy as install.
+With no arguments, `cdm upgrade` upgrades **every registered module** to the newest versions that work together, including modules discovered earlier with other `-p`/`--search-dirs` options. It never unregisters a module; newly discovered files are added. With `-r FILE` or package names, only those packages are upgraded, and every other module keeps its pinned versions. Both use the same conflict policy as install.
 
 
 #### **Managing the Cache**
@@ -130,7 +133,7 @@ cdm cache --remove --module auth
 
 #### **Resolving Dependencies Without Installing**
 
-You can see what ChaCC Dependency Manager *would* install without actually installing the packages. `cdm resolve` is a dry run: it prints the resolved pins and how many packages would be installed or changed. The result is cached, so a later `cdm install` doesn't resolve again.
+You can see what ChaCC Dependency Manager *would* install without actually installing the packages. `cdm resolve` is a dry run: it prints the resolved pins and how many packages would be installed or changed, and changes nothing, so the cache stays as it was and a `-r` file isn't registered. In Python, use `resolve_dependencies(..., dry_run=True)`.
 
 ```bash
 # Check what would be installed from requirements.txt
@@ -292,7 +295,7 @@ You can use caching in your CI/CD pipelines to persist the ChaCC Dependency Mana
 *   `"*.txt"`
 *   `"requirements-*.txt"`
 
-ChaCC Dependency Manager will search for these files in the current directory, or in the directories given by `search_dirs` (`cdm resolve --search-dirs ...`). Each file becomes a module named after the file without its extension. The discovered files are the complete set: if a file disappears, its pins are dropped on the next run. Modules added explicitly (in code, with `-r`, or as command-line packages) are kept.
+ChaCC Dependency Manager will search for these files in the current directory, or in the directories given by `search_dirs` (`cdm resolve --search-dirs ...`). Each file becomes a module named after the file without its extension (`requirements-api`). Paths inside a file (`-r base.txt`, `-c constraints.txt`, `-e ./libs/core`, `./libs/plugin`) are relative to that file, as pip reads them; in requirements text passed from Python they are relative to the current folder. Editing an included file (`-r` / `-c`) re-resolves the modules that include it. When several discovered files share a name, such as a `requirements.txt` in each service folder, each one is named after its path instead (`services/api/requirements`), so none of them is dropped. The discovered files are the complete set: if a file disappears, its pins are dropped on the next run. Modules added explicitly (in code, with `-r`, or as command-line packages) are kept. If no file is found at all (for example when run from the wrong folder), nothing is dropped and the registered modules are used.
 
 ### Protecting Core Packages with Constraints
 
@@ -338,7 +341,7 @@ To stop on conflicts instead, use `on_conflict="fail"` / `--on-conflict fail`. C
 
 ### Using ChaCC from an Async Server
 
-`resolve_dependencies()`, `upgrade_dependencies()` and `re_resolve_dependencies()` run pip in a worker thread, so awaiting them doesn't block the event loop. Calls that use the same cache directory run one at a time, even through separate `DependencyManager` or `Config` instances in the same process. Separate processes (for example several server workers) sharing one cache directory are **not** coordinated, so give each its own cache directory or run installs from one process. In scripts, use the blocking `resolve_dependencies_sync()` / `upgrade_dependencies_sync()` instead of `asyncio.run(...)`.
+`resolve_dependencies()`, `upgrade_dependencies()` and `re_resolve_dependencies()` run pip in a worker thread, so awaiting them doesn't block the event loop. Calls that use the same cache directory run one at a time: across separate `DependencyManager` or `Config` instances in one process, and across processes too (for example several server workers or parallel CI jobs), using a lock file (`.lock`) in the cache directory. A process that has to wait logs "Waiting for another process using the cache". On a file system without file locking (some network mounts), ChaCC logs a warning and only coordinates within the process. In scripts, use the blocking `resolve_dependencies_sync()` / `upgrade_dependencies_sync()` instead of `asyncio.run(...)`.
 
 ```python
 from chacc import DependencyManager, ResolutionError
@@ -416,6 +419,7 @@ class Config:
     resolve_timeout: Optional[int] = 600       # per pip-compile run; None disables
     constraint_files: Optional[List[str]] = None
     on_conflict: str = "resolve"               # or "fail"
+    log_level: Optional[Union[int, str]] = None  # e.g. "INFO" or logging.WARNING
 ```
 
 #### `DependencyManager` Class
@@ -434,14 +438,15 @@ class DependencyManager:
         max_retries: int = 5,
         resolve_timeout: Optional[int] = 600,
         constraint_files: Optional[List[str]] = None,
-        on_conflict: str = "resolve"
+        on_conflict: str = "resolve",
+        log_level: Optional[Union[int, str]] = None
     )
 ```
 
 ```python
 class DependencyManager:
-    async def resolve_dependencies(self, ..., install=True, replace=False) -> Dict[str, str]: ...
-    def resolve_dependencies_sync(self, ..., install=True, replace=False) -> Dict[str, str]: ...
+    async def resolve_dependencies(self, ..., install=True, replace=False, dry_run=False) -> Dict[str, str]: ...
+    def resolve_dependencies_sync(self, ..., install=True, replace=False, dry_run=False) -> Dict[str, str]: ...
     async def upgrade_dependencies(self, ...) -> Dict[str, str]: ...
     def upgrade_dependencies_sync(self, ...) -> Dict[str, str]: ...
     def invalidate_cache(self): ...
@@ -457,13 +462,15 @@ class DependencyManager:
 
 Module-level helpers mirror these and accept `config=`: `re_resolve_dependencies()`, `invalidate_dependency_cache()`, `invalidate_module_cache()` and `remove_module()`.
 
+`log_level` sets how much ChaCC logs, as a name (`"INFO"`, `"warning"`) or a number (`logging.INFO`). It applies to the `logger` you pass, or to ChaCC's own `dependency_manager` logger (shared by every manager that uses it). Left out, nothing changes: the built-in logger logs at DEBUG, as in earlier versions. On the command line, output is INFO, or DEBUG with `-v`.
+
 Resolution failures raise `chacc.ResolutionError` (with `.conflicts` and `.module`). pip install failures (after all retries) raise `subprocess.CalledProcessError`.
 
 ## Recent Updates (v1.4.0)
 
 This release fixes how packages are resolved, cached and installed. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
-> **Upgrade note:** the first run after upgrading clears the cache once and does a full resolve, because the environment hash changed.
+> **Upgrade note:** the first run after upgrading does one full resolve, because the environment hash changed. From now on, a change of Python version, OS or architecture re-resolves every registered module but keeps them registered.
 
 - **Failed resolutions are no longer cached.** A failure raises `ResolutionError` and leaves the cache untouched, so the next run tries again.
 - **Version-aware installs.** Packages installed at a different version from the resolved pin are reinstalled, so upgrades are applied. `cdm check` reports version mismatches.
@@ -473,10 +480,14 @@ This release fixes how packages are resolved, cached and installed. See [CHANGEL
 - **Compatible with 1.3.0.** Existing CLI commands and Python calls keep working. The main difference: a resolution failure now raises `ResolutionError` (and `cdm` exits with status 1) instead of being cached as an empty result.
 - **No stale pins.** Removing a module or a discovered requirements file drops its pins from the cache.
 - **Non-blocking async API.** pip runs in a worker thread, so async servers stay responsive.
+- **Safe with several processes.** Processes sharing a cache directory take turns, through a lock file.
+- **Includes work.** `-r`, `-c`, `-e` and local paths inside requirements files resolve relative to the file, and editing an included file triggers a new resolve.
 - **Timeouts.** pip-compile has a timeout (`--resolve-timeout`, default 600s). The pip install timeout default is back to 300s per attempt.
 - **Install location is logged.** A fallback to a user install is reported as a warning.
-- **Stable cache.** The environment hash no longer includes the host kernel version, so host updates don't clear the cache.
-- **`cdm resolve` is a dry run.** It prints what would be installed. `cdm resolve --install` also installs (the 1.3.0 behavior), and `cdm install` now accepts `-p/--pattern` and `--search-dirs`.
+- **Stable cache.** The environment hash no longer includes the host kernel version, so host updates don't clear the cache. A Python upgrade re-resolves every module without forgetting the ones registered one call at a time.
+- **Clear errors when offline.** If the package index can't be reached, the error says so, instead of being reported as a conflict between modules.
+- **`cdm resolve` is a dry run.** It prints what would be installed and changes nothing. `cdm resolve --install` also installs (the 1.3.0 behavior), and `cdm install` / `cdm upgrade` now accept `-p/--pattern` and `--search-dirs`.
+- **Same-named requirements files are all kept.** Several `requirements.txt` files in different folders become separate modules named after their path.
 
 ```bash
 cdm --resolve-timeout 900 --timeout 600 -c core-constraints.txt install

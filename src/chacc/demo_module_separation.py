@@ -1,54 +1,58 @@
 """
-Demonstrate how ChaCC separates dependencies by modules.
+Demonstrate how ChaCC handles modules that register their requirements one at a time.
+
+Resolves real packages (needs network access) into a temporary cache and installs nothing.
 """
 
-import sys
-sys.path.insert(0, 'src')
+import tempfile
 
-from chacc import DependencyManager
+from .manager import DependencyManager
+from .utils import format_conflict
+
+
+MODULES = {
+    'web': 'requests',
+    'reports': 'urllib3>=2',
+    # Asks for an older major version of a package another module already uses.
+    'legacy': 'urllib3<2',
+}
+
 
 def demo_module_separation():
-    """Show how ChaCC caches dependencies separately per module."""
-    print("=== ChaCC Module Separation Demo ===\n")
+    """Register modules one per call and show what ChaCC records for each."""
+    print("=== ChaCC Module Demo ===\n")
 
-    dm = DependencyManager(cache_dir='./demo_cache')
+    with tempfile.TemporaryDirectory(prefix="chacc-demo-") as cache_dir:
+        dm = DependencyManager(cache_dir=cache_dir)
 
-    modules = {
-        'web': 'fastapi>=0.100.0\nuvicorn[standard]>=0.20.0\npydantic>=2.0.0',
-        'auth': 'passlib[bcrypt]>=1.7.0\npython-jose[cryptography]>=3.5.0\npython-multipart>=0.0.5',
-        'database': 'sqlalchemy>=2.0.0\nalembic>=1.10.0\npsycopg2-binary>=2.9.0'
-    }
+        print("📦 Registering modules one at a time (nothing is installed):")
+        for module_name, requirements in MODULES.items():
+            print(f"\n🔍 Module: {module_name}  (requirements: {requirements.replace(chr(10), ', ')})")
+            pins = dm.resolve_dependencies_sync({module_name: requirements}, install=False)
+            print(f"   Checked against the modules registered before it → {len(pins)} packages in total")
+            for conflict in dm.last_conflicts:
+                print(f"   ⚠️  {format_conflict(conflict)}")
 
-    print("📦 Processing modules with separate dependencies:")
-    for module_name, requirements in modules.items():
-        print(f"\n🔍 Module: {module_name}")
-        print(f"   Requirements: {requirements.replace(chr(10), ', ')}")
+        cache = dm.load_cache()
+        print("\n💾 What the cache records per module:")
+        for module_name, entry in sorted(cache['requirements_caches'].items(), key=lambda i: i[1].get('order', 0)):
+            packages = entry.get('packages', {})
+            skipped = entry.get('skipped_packages') or []
+            note = f", skipped: {', '.join(skipped)}" if skipped else ""
+            print(f"  📁 {module_name} (#{entry.get('order')}, {entry.get('source')}): "
+                  f"{len(packages)} packages{note}")
+            for package, version in list(packages.items())[:3]:
+                print(f"     └─ {package}{version}")
 
-        packages = dm.resolve_module_dependencies(module_name, requirements)
-        print(f"   Resolved {len(packages)} packages")
+        print(f"\n📊 Shared resolved_packages: {len(cache['resolved_packages'])} packages, one version each")
 
-        sample_packages = list(packages.items())[:3]
-        for pkg, version in sample_packages:
-            print(f"     📋 {pkg}{version}")
+    print("\n✅ Key points:")
+    print("   • Each call adds a module and checks it against every module registered earlier")
+    print("   • Unchanged modules are not resolved again, and existing pins are kept where possible")
+    print("   • Same major version → the latest is used; different major → the earlier module wins")
+    print("     and the newcomer's requirement is skipped and flagged (the module still loads)")
+    print("   • dm.remove_module('legacy') unregisters a module; its pins go on the next resolve")
 
-    print("\n💾 Cache Structure (module separation):")
-    cache = dm.load_cache()
-
-    print("requirements_caches:")
-    for module_name, module_cache in cache.get('requirements_caches', {}).items():
-        packages = module_cache.get('packages', {})
-        print(f"  📁 {module_name}: {len(packages)} packages")
-        sample_pkgs = list(packages.items())[:2]
-        for pkg, version in sample_pkgs:
-            print(f"     └─ {pkg}{version}")
-
-    print(f"\n📊 Combined resolved_packages: {len(cache.get('resolved_packages', {}))} total unique packages")
-
-    print("\n✅ Key Benefits of Module Separation:")
-    print("   • Each module's dependencies are cached separately")
-    print("   • Only re-resolve when a specific module's requirements change")
-    print("   • Can invalidate cache for individual modules")
-    print("   • Clear visibility into which module needs which packages")
 
 if __name__ == "__main__":
     demo_module_separation()

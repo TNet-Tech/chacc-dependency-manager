@@ -50,6 +50,7 @@ class FakeRunner:
         self.compile_stderr = compile_stderr
         self.compile_calls = []
         self.install_calls = []
+        self.install_cmds = []
 
     def __call__(self, cmd, **kwargs):
         result = MagicMock()
@@ -74,6 +75,7 @@ class FakeRunner:
                     f.write(lock)
         elif 'install' in cmd:
             self.install_calls.append([a for a in cmd if '==' in a])
+            self.install_cmds.append(cmd)
         return result
 
 
@@ -437,7 +439,7 @@ def test_same_major_conflict_uses_latest(cache_dir):
     assert conflict['kind'] == 'minor' and conflict['skipped_modules'] == []
     # Merged pins break a declared requirement, so they are installed exactly as pinned.
     assert runner.install_calls[-1] == ['urllib3==1.26.18']
-    assert dm.load_cache()['install_no_deps'] is True
+    assert '--no-deps' in runner.install_cmds[-1]
 
 
 def test_major_conflict_keeps_existing_and_flags_newcomer(cache_dir):
@@ -624,3 +626,280 @@ def test_cli_install_accepts_pattern_and_search_dirs(tmp_path):
               '-p', 'requirements-*.txt', '--search-dirs', str(tmp_path)])
     assert runner.install_calls == [['requests==2.31.0']]
     assert set(DependencyManager(cache_dir=cache).load_cache()['requirements_caches']) == {'requirements-web'}
+
+
+# --- Pre-release review fixes ----------------------------------------------------------
+
+REQ_VERSIONS = {'requests': ('requests', '2.31.0'), 'idna': ('idna', '3.6'), 'flask': ('flask', '3.0.0')}
+
+
+def versions_runner():
+    return FakeRunner(lock=lambda inputs: lock_for(inputs, REQ_VERSIONS))
+
+
+def test_same_named_files_in_different_folders_are_all_kept(cache_dir, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'api').mkdir()
+    (tmp_path / 'worker').mkdir()
+    (tmp_path / 'api' / 'requirements.txt').write_text('requests')
+    (tmp_path / 'worker' / 'requirements.txt').write_text('idna')
+    (tmp_path / 'worker' / 'extra.txt').write_text('flask')
+    dm = make_dm(cache_dir)
+    with patch.object(manager_module.subprocess, 'run', versions_runner()):
+        pins = dm.resolve_dependencies_sync(requirements_file_pattern='*.txt',
+                                            search_dirs=['api', 'worker'], install=False)
+    assert pins == {'requests': '==2.31.0', 'idna': '==3.6', 'flask': '==3.0.0'}
+    # Unique filenames keep the short 1.3 name; clashing ones get their folder.
+    assert set(dm.load_cache()['requirements_caches']) == {'api/requirements', 'worker/requirements', 'extra'}
+
+
+def test_cli_requirements_files_with_same_name_dont_overwrite(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'requirements.txt').write_text('flask')
+    (tmp_path / 'api').mkdir()
+    (tmp_path / 'api' / 'requirements.txt').write_text('requests')
+    cache = str(tmp_path / 'cache')
+    with patch.object(manager_module.subprocess, 'run', versions_runner()), \
+         patch.object(manager_module, 'get_installed_versions', return_value={}), \
+         patch('builtins.print'):
+        _cli(['--cache-dir', cache, '--max-retries', '1', 'install', '-r', 'requirements.txt'])
+        _cli(['--cache-dir', cache, '--max-retries', '1', 'install', '-r', 'api/requirements.txt'])
+    cache_data = DependencyManager(cache_dir=cache).load_cache()
+    # ./requirements.txt keeps the name auto-discovery gives it.
+    assert set(cache_data['requirements_caches']) == {'requirements', 'api/requirements'}
+    assert set(cache_data['resolved_packages']) == {'flask', 'requests'}
+
+
+def test_environment_change_keeps_registered_modules(cache_dir):
+    dm = make_dm(cache_dir)
+    runner = versions_runner()
+    with patch.object(manager_module.subprocess, 'run', runner):
+        dm.resolve_dependencies_sync({'auth': 'requests'}, install=False)
+        dm.resolve_dependencies_sync({'payments': 'idna'}, install=False)
+        with patch.object(manager_module, 'get_environment_hash', return_value='new-python'):
+            pins = dm.resolve_dependencies_sync({'reports': 'flask'}, install=False)
+    assert pins == {'requests': '==2.31.0', 'idna': '==3.6', 'flask': '==3.0.0'}
+    # Fresh resolve for the new environment: no seed from the old one.
+    assert runner.compile_calls[-1]['seed'] == ''
+    assert set(dm.load_cache()['requirements_caches']) == {'auth', 'payments', 'reports'}
+
+
+def test_environment_change_before_upgrade_keeps_registered_modules(cache_dir):
+    dm = make_dm(cache_dir)
+    with patch.object(manager_module.subprocess, 'run', versions_runner()):
+        dm.resolve_dependencies_sync({'auth': 'requests', 'payments': 'idna'}, install=False)
+        with patch.object(manager_module, 'get_environment_hash', return_value='new-python'), \
+             patch.object(manager_module, 'get_installed_versions', return_value={}):
+            pins = dm.upgrade_dependencies_sync({'payments': 'idna'})
+    assert set(pins) == {'requests', 'idna'}
+
+
+def test_dry_run_does_not_register_or_save(cache_dir):
+    dm = make_dm(cache_dir)
+    runner = versions_runner()
+    with patch.object(manager_module.subprocess, 'run', runner):
+        dm.resolve_dependencies_sync({'auth': 'requests'}, install=False)
+        before = dm.load_cache()
+        pins = dm.resolve_dependencies_sync({'experimental': 'flask'}, dry_run=True)
+    assert pins == {'requests': '==2.31.0', 'flask': '==3.0.0'}
+    assert dm.load_cache() == before
+    assert runner.install_calls == []
+
+
+def test_cli_resolve_dry_run_leaves_cache_alone(tmp_path):
+    (tmp_path / 'experimental.txt').write_text('flask')
+    cache = str(tmp_path / 'cache')
+    with patch.object(manager_module.subprocess, 'run', versions_runner()), \
+         patch('chacc.cli.get_installed_versions', return_value={}), \
+         patch('builtins.print'):
+        _cli(['--cache-dir', cache, 'resolve', '-r', str(tmp_path / 'experimental.txt')])
+    assert DependencyManager(cache_dir=cache).load_cache()['requirements_caches'] == {}
+
+
+def test_discovery_finding_nothing_still_installs_registered_modules(cache_dir, tmp_path):
+    dm = make_dm(cache_dir)
+    runner = versions_runner()
+    with patch.object(manager_module.subprocess, 'run', runner), \
+         patch.object(manager_module, 'get_installed_versions', return_value={}):
+        dm.resolve_dependencies_sync({'cli': 'requests'}, install=False)
+        (tmp_path / 'requirements.txt').write_text('idna')
+        dm.resolve_dependencies_sync(search_dirs=[str(tmp_path)], install=False)
+        (tmp_path / 'requirements.txt').unlink()
+        pins = dm.resolve_dependencies_sync(search_dirs=[str(tmp_path / 'empty')])
+    # Nothing found (wrong folder?): every registered module is kept and installed.
+    assert pins == {'requests': '==2.31.0', 'idna': '==3.6'}
+    assert sorted(sum(runner.install_calls, [])) == ['idna==3.6', 'requests==2.31.0']
+
+
+def test_upgrade_without_arguments_keeps_modules_discovered_elsewhere(cache_dir, tmp_path):
+    dm = make_dm(cache_dir)
+    (tmp_path / 'services').mkdir()
+    (tmp_path / 'services' / 'requirements-api.txt').write_text('requests')
+    runner = versions_runner()
+    with patch.object(manager_module.subprocess, 'run', runner), \
+         patch.object(manager_module, 'get_installed_versions', return_value={}):
+        dm.resolve_dependencies_sync(requirements_file_pattern='requirements-*.txt',
+                                     search_dirs=[str(tmp_path / 'services')], install=False)
+        dm.resolve_dependencies_sync({'cli': 'idna'}, install=False)
+        pins = dm.upgrade_dependencies_sync(search_dirs=[str(tmp_path / 'nothing-here')])
+    assert '--upgrade' in runner.compile_calls[-1]['cmd']
+    assert pins == {'requests': '==2.31.0', 'idna': '==3.6'}
+    assert set(dm.load_cache()['requirements_caches']) == {'requirements-api', 'cli'}
+
+
+def test_cli_upgrade_accepts_pattern_and_search_dirs(tmp_path):
+    (tmp_path / 'requirements-web.txt').write_text('requests')
+    cache = str(tmp_path / 'cache')
+    runner = versions_runner()
+    with patch.object(manager_module.subprocess, 'run', runner), \
+         patch.object(manager_module, 'get_installed_versions', return_value={}), \
+         patch('builtins.print'):
+        _cli(['--cache-dir', cache, 'upgrade', '-p', 'requirements-*.txt', '--search-dirs', str(tmp_path)])
+    assert '--upgrade' in runner.compile_calls[-1]['cmd']
+    assert set(DependencyManager(cache_dir=cache).load_cache()['requirements_caches']) == {'requirements-web'}
+
+
+def test_network_error_is_not_reported_as_a_conflict(cache_dir):
+    dm = make_dm(cache_dir)
+    with patch.object(manager_module.subprocess, 'run', versions_runner()):
+        dm.resolve_dependencies_sync({'auth': 'requests'}, install=False)
+    offline = FakeRunner(compile_rc=1, compile_stderr=(
+        "WARNING: Retrying ... NewConnectionError('Failed to establish a new connection')\n"
+        "ERROR: Could not find a version that satisfies the requirement idna"
+    ))
+    with patch.object(manager_module.subprocess, 'run', offline):
+        with pytest.raises(ResolutionError, match="could not be reached") as info:
+            dm.resolve_dependencies_sync({'payments': 'idna'}, install=False)
+    assert info.value.module is None
+    # One attempt only: no per-module fallback.
+    assert len(offline.compile_calls) == 1
+    assert set(dm.load_cache()['requirements_caches']) == {'auth'}
+
+
+def test_cli_resolve_install_runs_pip_list_once(tmp_path):
+    (tmp_path / 'requirements.txt').write_text('requests')
+    cache = str(tmp_path / 'cache')
+    with patch.object(manager_module.subprocess, 'run', versions_runner()), \
+         patch.object(manager_module, 'get_installed_versions', return_value={}) as manager_list, \
+         patch('chacc.cli.get_installed_versions', return_value={}) as cli_list, \
+         patch('builtins.print'):
+        _cli(['--cache-dir', cache, 'resolve', '--install', '--search-dirs', str(tmp_path)])
+    assert manager_list.call_count == 1 and cli_list.call_count == 0
+
+
+# --- Paths inside requirements files and the cross-process lock -------------------------
+
+def test_absolutize_requirement_paths(tmp_path):
+    from chacc.utils import absolutize_requirement_paths
+    base = str(tmp_path)
+    text = "\n".join([
+        "-r base.txt",
+        "--requirement=../shared/reqs.txt  # shared",
+        "-c constraints.txt",
+        "-e ./libs/core",
+        "./libs/plugin[extra]",
+        "-e git+https://example.com/repo.git#egg=x",
+        "-r /abs/other.txt",
+        "requests>=2  # normal line",
+        "--index-url https://example.com/simple",
+    ])
+    out = absolutize_requirement_paths(text, base).splitlines()
+    assert out[0] == f"-r {os.path.join(base, 'base.txt')}"
+    assert out[1] == f"--requirement={os.path.normpath(os.path.join(base, '../shared/reqs.txt'))}  # shared"
+    assert out[2] == f"-c {os.path.join(base, 'constraints.txt')}"
+    assert out[3] == f"-e {os.path.join(base, 'libs/core')}"
+    assert out[4] == os.path.join(base, 'libs/plugin[extra]')
+    assert out[5:] == text.splitlines()[5:]
+
+
+def test_included_files_are_resolved_from_the_file_and_tracked(cache_dir, tmp_path):
+    (tmp_path / 'base.txt').write_text('idna')
+    (tmp_path / 'api').mkdir()
+    (tmp_path / 'api' / 'requirements.txt').write_text('-r ../base.txt\nrequests')
+    dm = make_dm(cache_dir)
+    runner = FakeRunner(lock="idna==3.6\nrequests==2.31.0\n")
+    with patch.object(manager_module.subprocess, 'run', runner):
+        dm.resolve_dependencies_sync(search_dirs=[str(tmp_path / 'api')], install=False)
+        [module_input] = runner.compile_calls[0]['inputs'].values()
+        assert f"-r {tmp_path / 'base.txt'}" in module_input
+
+        dm.resolve_dependencies_sync(search_dirs=[str(tmp_path / 'api')], install=False)
+        assert len(runner.compile_calls) == 1  # unchanged: cache hit
+
+        (tmp_path / 'base.txt').write_text('idna\nsix')
+        dm.resolve_dependencies_sync(search_dirs=[str(tmp_path / 'api')], install=False)
+        assert len(runner.compile_calls) == 2  # included file changed: re-resolved
+
+
+def test_relative_paths_in_passed_text_and_cli_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'svc').mkdir()
+    (tmp_path / 'svc' / 'reqs.txt').write_text('-e ./lib')
+    cache = str(tmp_path / 'cache')
+    runner = FakeRunner(lock="lib @ file:///x\n")
+    with patch.object(manager_module.subprocess, 'run', runner), \
+         patch.object(manager_module, 'get_installed_versions', return_value={}), \
+         patch('builtins.print'):
+        # Passed-in text: relative to the current folder.
+        DependencyManager(cache_dir=cache).resolve_dependencies_sync({'plugin': '-e ./plugins/x'}, install=False)
+        # cdm -r FILE: relative to the file's folder.
+        _cli(['--cache-dir', cache, 'resolve', '-r', 'svc/reqs.txt'])
+    inputs = [list(c['inputs'].values()) for c in runner.compile_calls]
+    assert f"-e {tmp_path / 'plugins' / 'x'}" in inputs[0][0]
+    assert any(f"-e {tmp_path / 'svc' / 'lib'}" in text for text in inputs[1])
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason="uses a POSIX shell-free child process timing")
+def test_cache_lock_is_shared_across_processes(cache_dir):
+    child = subprocess.Popen(
+        [sys.executable, '-c',
+         "import sys, time; sys.path.insert(0, 'src')\n"
+         "from chacc import DependencyManager\n"
+         f"dm = DependencyManager(cache_dir={cache_dir!r})\n"
+         "with dm._lock:\n"
+         "    print('locked', flush=True)\n"
+         "    time.sleep(1.5)\n"],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == 'locked'
+        started = time.monotonic()
+        with make_dm(cache_dir)._lock:
+            waited = time.monotonic() - started
+    finally:
+        child.wait(timeout=10)
+    assert waited > 0.8
+
+
+def test_cache_lock_is_reentrant(cache_dir):
+    dm = make_dm(cache_dir)
+    with dm._lock:
+        with dm._lock:
+            pass
+        assert dm._lock._fd is not None
+    assert dm._lock._fd is None
+
+
+# --- log_level -------------------------------------------------------------------------
+
+def test_log_level_option(cache_dir):
+    import logging
+    from chacc import Config
+    own = logging.getLogger('chacc-test-own')
+    make_dm(cache_dir, logger=own, log_level='warning')
+    assert own.level == logging.WARNING
+    Config(cache_dir=cache_dir, logger=own, log_level=logging.ERROR).create_manager()
+    assert own.level == logging.ERROR
+
+    default = logging.getLogger('dependency_manager')
+    before = default.level
+    try:
+        make_dm(cache_dir)  # not passed: level untouched
+        assert default.level == before
+        make_dm(cache_dir, log_level='INFO')
+        assert default.level == logging.INFO
+    finally:
+        default.setLevel(before)
+
+    with pytest.raises(ValueError, match="Unknown log_level"):
+        make_dm(cache_dir, log_level='loud')

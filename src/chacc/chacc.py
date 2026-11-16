@@ -31,14 +31,15 @@ Example:
     await dm.resolve_dependencies()
 """
 
-from .manager import DependencyManager, ResolutionError
-from .utils import (
+# Re-exported for code that imports these from chacc.chacc (as in earlier versions).
+from .manager import DependencyManager, ResolutionError  # noqa: F401
+from .utils import (  # noqa: F401
     calculate_module_hash,
     calculate_combined_requirements_hash,
     get_installed_packages
 )
 import logging
-from typing import Optional, Callable, Dict, Set, List
+from typing import Optional, Callable, Dict, Set, List, Union
 from dataclasses import dataclass
 
 
@@ -49,12 +50,13 @@ class Config:
     logger: Optional[logging.Logger] = None
     pre_resolve_hook: Optional[Callable[[str, str], None]] = None
     post_resolve_hook: Optional[Callable[[str, Dict[str, str]], None]] = None
-    install_hook: Optional[Callable[[Dict[str, str], Dict[str, str]], bool]] = None
+    install_hook: Optional[Callable[[Dict[str, str], Set[str]], bool]] = None
     install_timeout: Optional[int] = 300
     max_retries: int = 5
     resolve_timeout: Optional[int] = 600
     constraint_files: Optional[List[str]] = None
     on_conflict: str = "resolve"
+    log_level: Optional[Union[int, str]] = None
 
     def create_manager(self) -> DependencyManager:
         """Create a DependencyManager with this configuration."""
@@ -68,11 +70,13 @@ class Config:
             max_retries=self.max_retries,
             resolve_timeout=self.resolve_timeout,
             constraint_files=self.constraint_files,
-            on_conflict=self.on_conflict
+            on_conflict=self.on_conflict,
+            log_level=self.log_level,
         )
 
 
 dependency_manager = DependencyManager()
+
 
 def load_dependency_cache(config: Optional[Config] = None) -> Dict:
     """Load dependency cache from file."""
@@ -81,6 +85,7 @@ def load_dependency_cache(config: Optional[Config] = None) -> Dict:
         return dm.load_cache()
     return dependency_manager.load_cache()
 
+
 def save_dependency_cache(cache_data: Dict, config: Optional[Config] = None):
     """Save dependency cache to file."""
     if config:
@@ -88,6 +93,7 @@ def save_dependency_cache(cache_data: Dict, config: Optional[Config] = None):
         dm.save_cache(cache_data)
     else:
         dependency_manager.save_cache(cache_data)
+
 
 def resolve_module_dependencies(
     module_name: str,

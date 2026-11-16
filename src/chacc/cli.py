@@ -11,7 +11,8 @@ from pathlib import Path
 
 from .chacc import DependencyManager
 from .utils import (
-    canonicalize_name, base_package_name, format_conflict, get_installed_versions, version_satisfies
+    absolutize_requirement_paths, canonicalize_name, base_package_name, format_conflict, get_installed_versions,
+    module_name_for_path, version_satisfies,
 )
 
 
@@ -22,6 +23,13 @@ def setup_logging(verbose: bool = False):
         level=level,
         format='%(levelname)s: %(message)s'
     )
+    # The library logger has its own handler (and DEBUG level) for use without any
+    # logging setup. Under the CLI, let the root handler print it once, at the CLI level.
+    library_logger = logging.getLogger('dependency_manager')
+    for handler in list(library_logger.handlers):
+        library_logger.removeHandler(handler)
+    library_logger.setLevel(level)
+    library_logger.propagate = True
 
 
 def _make_manager(args) -> DependencyManager:
@@ -38,6 +46,13 @@ def _make_manager(args) -> DependencyManager:
     )
 
 
+def _requirements_file(path: str) -> dict:
+    """``-r FILE`` as a module: ``requirements.txt`` -> ``requirements``, ``api/reqs.txt`` -> ``api/reqs``."""
+    # Paths inside the file (-r base.txt, -e ./lib) are relative to the file itself.
+    content = absolutize_requirement_paths(Path(path).read_text(), str(Path(path).resolve().parent))
+    return {module_name_for_path(path): content}
+
+
 def cmd_install(args):
     """Install packages with dependency resolution."""
     setup_logging(args.verbose)
@@ -46,7 +61,7 @@ def cmd_install(args):
 
     if args.requirements:
         print(f"Installing from {args.requirements}...")
-        requirements = {Path(args.requirements).stem: Path(args.requirements).read_text()}
+        requirements = _requirements_file(args.requirements)
         dm.resolve_dependencies_sync(requirements)
     elif args.packages:
         print(f"Installing packages: {', '.join(args.packages)}...")
@@ -69,7 +84,7 @@ def cmd_resolve(args):
     dm = _make_manager(args)
 
     if args.requirements:
-        requirements = {Path(args.requirements).stem: Path(args.requirements).read_text()}
+        requirements = _requirements_file(args.requirements)
     else:
         requirements = None
 
@@ -79,22 +94,20 @@ def cmd_resolve(args):
         modules_requirements=requirements,
         requirements_file_pattern=args.pattern,
         search_dirs=args.search_dirs,
-        install=False
+        install=install,
+        dry_run=not install,
     )
 
-    installed = get_installed_versions()
-    missing, wrong_version, _ = dm.packages_needing_install(pins, installed)
     for package_name, version_spec in sorted(pins.items(), key=lambda item: item[0].lower()):
         print(f"   {package_name}{version_spec}")
-    if not install:
-        print(f"✅ Dependencies resolved: {len(pins)} packages "
-              f"({len(missing)} would be installed, {len(wrong_version)} would change version)")
+    if install:
+        print(f"✅ Dependencies resolved and installed: {len(pins)} packages")
         return
 
-    print(f"Installing: {len(missing)} missing, {len(wrong_version)} version changes...")
-    dm._install(pins, no_deps=bool(dm.last_conflicts))
-    print(f"✅ Dependencies resolved and installed: {len(pins)} packages "
-          f"({len(missing)} installed, {len(wrong_version)} changed version)")
+    missing, wrong_version, _ = dm.packages_needing_install(pins, get_installed_versions())
+    print(f"✅ Dependencies resolved: {len(pins)} packages "
+          f"({len(missing)} would be installed, {len(wrong_version)} would change version). "
+          f"Nothing was installed or saved; use --install to apply")
 
 
 def cmd_cache(args):
@@ -269,15 +282,18 @@ def cmd_upgrade(args):
 
     if args.requirements:
         print(f"Upgrading from {args.requirements}...")
-        requirements = {Path(args.requirements).stem: Path(args.requirements).read_text()}
+        requirements = _requirements_file(args.requirements)
         dm.upgrade_dependencies_sync(requirements)
     elif args.packages:
         print(f"Upgrading packages: {', '.join(args.packages)}...")
         requirements = {"cli": "\n".join(args.packages)}
         dm.upgrade_dependencies_sync(requirements)
     else:
-        print("Auto-discovering and upgrading requirements...")
-        dm.upgrade_dependencies_sync()
+        print("Upgrading every registered module (and any newly discovered requirements files)...")
+        dm.upgrade_dependencies_sync(
+            requirements_file_pattern=getattr(args, 'pattern', 'requirements.txt'),
+            search_dirs=getattr(args, 'search_dirs', None),
+        )
 
     print("✅ Upgrade completed")
 
@@ -287,7 +303,7 @@ def cmd_demo(args):
     setup_logging(args.verbose)
 
     if args.type == 'modules':
-        print("🚀 Running module separation demo...")
+        print("🚀 Running module demo (resolves real packages, installs nothing)...")
         from .demo_module_separation import demo_module_separation
         demo_module_separation()
     elif args.type == 'cache':
@@ -296,8 +312,8 @@ def cmd_demo(args):
         demo_cache_structure()
     else:
         print("Available demos:")
-        print("  cdm demo modules  - Show module-based dependency separation")
-        print("  cdm demo cache    - Show cache structure and organization")
+        print("  cdm demo modules  - Register modules one at a time and see how conflicts are handled")
+        print("  cdm demo cache    - Show what the cache file records")
 
 
 def create_parser():
@@ -396,6 +412,16 @@ def create_parser():
     upgrade_parser.add_argument(
         "-r", "--requirements",
         help="Upgrade from requirements file"
+    )
+    upgrade_parser.add_argument(
+        "-p", "--pattern",
+        default="requirements.txt",
+        help="File pattern to auto-discover new requirements files (default: requirements.txt)"
+    )
+    upgrade_parser.add_argument(
+        "--search-dirs",
+        nargs="*",
+        help="Directories to auto-discover requirements files in (default: current dir)"
     )
     upgrade_parser.set_defaults(func=cmd_upgrade)
 

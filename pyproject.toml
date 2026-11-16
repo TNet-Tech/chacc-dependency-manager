@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "chacc-dependency-manager"
 version = "1.4.0"
-description = "Pip accelerator package. Intelligent, incremental dependency resolution and caching for pip environment based applications. It it meant to complement pip"
+description = "Pip accelerator package. Intelligent, incremental dependency resolution and caching for pip environment based applications. It is meant to complement pip"
 authors = [
     {name = "Jonas G Mwambimbi", email = "jonasgeorge1015@gmail.com"}
 ]
@@ -13,7 +13,8 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
 dependencies = [
-    "pip-tools>=7.0.0"
+    "pip-tools>=7.0.0",
+    "packaging>=20.0"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -137,7 +138,7 @@ python_classes = "Test*"
 python_functions = "test_*"
 
 [tool.coverage.run]
-source = ["src/package"]
+source = ["src/chacc"]
 omit = [
     "*/tests/*",
     "*/test_*.py",

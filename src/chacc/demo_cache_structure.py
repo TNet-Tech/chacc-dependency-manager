@@ -1,112 +1,91 @@
 """
-Show ChaCC's module-based cache structure.
+Show the structure of ChaCC's cache file (dependency_cache.json).
+
+Uses a sample cache in a temporary directory, so no network access is needed.
 """
 
-import sys
-sys.path.insert(0, 'src')
+import json
+import tempfile
 
-from chacc import DependencyManager
+from .manager import DependencyManager
+from .utils import format_conflict, get_environment_hash
 
-def demo_cache_structure():
-    """Show how ChaCC structures cache by modules."""
-    print("=== ChaCC Module-Based Cache Structure ===\n")
 
-    dm = DependencyManager(cache_dir='./demo_cache')
-
-    simulated_cache = {
+def _sample_cache() -> dict:
+    return {
         'requirements_caches': {
             'web': {
-                'hash': 'abc123_web_hash',
-                'packages': {
-                    'fastapi': '==0.104.1',
-                    'uvicorn': '==0.24.0',
-                    'pydantic': '==2.5.0',
-                    'starlette': '==0.27.0',
-                    'uvicorn[standard]': '==0.24.0'
-                },
-                'last_updated': '2024-01-01T10:00:00'
+                'hash': 'a1b2c3d4e5f6…',
+                'requirements': 'fastapi>=0.100\nuvicorn',
+                'packages': {'fastapi': '==0.115.0', 'starlette': '==0.38.6', 'uvicorn': '==0.30.6'},
+                'complete': True,
+                'order': 1,
+                'source': 'discovered',
+                'skipped_packages': [],
+                'last_updated': '1763290000.0',
             },
-            'auth': {
-                'hash': 'def456_auth_hash',
-                'packages': {
-                    'passlib[bcrypt]': '==1.7.4',
-                    'python-jose[cryptography]': '==3.5.0',
-                    'python-multipart': '==0.0.6',
-                    'bcrypt': '==4.0.1',
-                    'cryptography': '==41.0.7'
-                },
-                'last_updated': '2024-01-01T10:05:00'
+            'payments': {
+                'hash': 'f6e5d4c3b2a1…',
+                'requirements': 'stripe\nurllib3<2',
+                'packages': {'stripe': '==10.12.0', 'urllib3': '==1.26.20'},
+                'complete': True,
+                'order': 2,
+                'source': 'explicit',
+                'skipped_packages': ['urllib3'],
+                'last_updated': '1763290100.0',
             },
-            'database': {
-                'hash': 'ghi789_db_hash',
-                'packages': {
-                    'sqlalchemy': '==2.0.23',
-                    'alembic': '==1.13.1',
-                    'psycopg2-binary': '==2.9.9',
-                    'typing-extensions': '==4.9.0',
-                    'greenlet': '==3.0.3'
-                },
-                'last_updated': '2024-01-01T10:10:00'
-            }
         },
-        'combined_hash': 'combined_xyz_hash',
+        'combined_hash': '9f8e7d6c5b4a…',
+        'environment_hash': get_environment_hash(),
         'resolved_packages': {
-            'fastapi': '==0.104.1',
-            'uvicorn': '==0.24.0',
-            'pydantic': '==2.5.0',
-            'starlette': '==0.27.0',
-            'uvicorn[standard]': '==0.24.0',
-            'passlib[bcrypt]': '==1.7.4',
-            'python-jose[cryptography]': '==3.5.0',
-            'python-multipart': '==0.0.6',
-            'bcrypt': '==4.0.1',
-            'cryptography': '==41.0.7',
-            'sqlalchemy': '==2.0.23',
-            'alembic': '==1.13.1',
-            'psycopg2-binary': '==2.9.9',
-            'typing-extensions': '==4.9.0',
-            'greenlet': '==3.0.3'
+            'fastapi': '==0.115.0', 'starlette': '==0.38.6', 'uvicorn': '==0.30.6',
+            'stripe': '==10.12.0', 'urllib3': '==2.2.3',
         },
-        'last_updated': '2024-01-01T10:10:00'
+        'conflicts': [{
+            'package': 'urllib3', 'chosen': '2.2.3', 'chosen_from': 'web',
+            'requested': {'web': '2.2.3', 'payments': '1.26.20'},
+            'kind': 'major', 'skipped_modules': ['payments'],
+        }],
+        'last_updated': '1763290100.0',
     }
 
-    dm.save_cache(simulated_cache)
-    loaded_cache = dm.load_cache()
 
-    print("📂 Cache Structure by Module:")
-    print("=" * 50)
+def demo_cache_structure():
+    """Print each part of the cache and what it is used for."""
+    print("=== ChaCC Cache Structure ===\n")
 
-    req_caches = loaded_cache.get('requirements_caches', {})
-    for module_name, module_data in req_caches.items():
-        packages = module_data.get('packages', {})
-        print(f"\n🔹 Module: {module_name}")
-        print(f"   📋 Hash: {module_data.get('hash', 'N/A')[:12]}...")
-        print(f"   📦 Packages: {len(packages)}")
-        print("   📅 Last Updated: {}".format(module_data.get('last_updated', 'N/A')))
+    with tempfile.TemporaryDirectory(prefix="chacc-demo-") as cache_dir:
+        dm = DependencyManager(cache_dir=cache_dir)
+        dm.save_cache(_sample_cache())
+        cache = dm.load_cache()
 
-        # Show first 3 packages for this module
-        print("   📋 Sample packages:")
-        for i, (pkg, version) in enumerate(list(packages.items())[:3]):
-            print(f"      {i+1}. {pkg}{version}")
-        if len(packages) > 3:
-            print(f"      ... and {len(packages) - 3} more")
+    print("📂 requirements_caches: one entry per registered module")
+    for name, entry in cache['requirements_caches'].items():
+        print(f"\n🔹 {name}")
+        print(f"   requirements     : {entry['requirements']!r}  (kept so the full set can be rebuilt)")
+        print(f"   order / source   : #{entry['order']} / {entry['source']}  (earlier wins major conflicts; "
+              "discovered modules are dropped when their file disappears)")
+        print(f"   packages         : {len(entry['packages'])} (everything this module pulls in)")
+        if entry['skipped_packages']:
+            print(f"   skipped_packages : {', '.join(entry['skipped_packages'])} (major-version conflict)")
 
-    print(f"\n📊 Combined View:")
-    print(f"   🎯 Total unique packages: {len(loaded_cache.get('resolved_packages', {}))}")
-    print(f"   📁 Total modules cached: {len(req_caches)}")
-    print(f"   🔄 Combined hash: {loaded_cache.get('combined_hash', 'N/A')[:12]}...")
+    print("\n📊 Shared state:")
+    print(f"   resolved_packages : {len(cache['resolved_packages'])} pins, the versions that get installed")
+    print("   combined_hash     : all module hashes plus constraint files; a change triggers a resolve")
+    print("   environment_hash  : Python version, OS and CPU; a change re-resolves every module")
+    print("   conflicts         :")
+    for conflict in cache['conflicts']:
+        print(f"      • {format_conflict(conflict)}")
 
-    print("\n✅ Module Separation Benefits:")
-    print("   • Each module has its own cache entry")
-    print("   • Individual module cache invalidation")
-    print("   • Only re-resolve changed modules")
-    print("   • Clear dependency ownership tracking")
-    print("   • Supports modular application architecture")
+    print("\n📄 Raw JSON for one module:")
+    print(json.dumps(cache['requirements_caches']['payments'], indent=2))
 
-    print("\n🔧 Available Operations:")
-    print("   • dm.invalidate_module_cache('web') - Clear only web module")
-    print("   • dm.invalidate_cache() - Clear all modules")
-    print("   • Individual module resolution tracking")
+    print("\n🔧 Operations:")
+    print("   • cdm cache --info                      / dm.load_cache()")
+    print("   • cdm cache --clear --module web        / dm.invalidate_module_cache('web')  (re-resolve it)")
+    print("   • cdm cache --remove --module payments  / dm.remove_module('payments')       (unregister it)")
+    print("   • cdm cache --clear                     / dm.invalidate_cache()              (forget everything)")
+
 
 if __name__ == "__main__":
     demo_cache_structure()

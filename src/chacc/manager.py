@@ -5,6 +5,7 @@ Provides intelligent, incremental dependency resolution and caching for modular 
 """
 
 import asyncio
+import errno
 import functools
 import glob
 import json
@@ -22,6 +23,7 @@ import time
 from typing import Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 from .utils import (
+    absolutize_requirement_paths,
     attribute_packages,
     base_package_name,
     calculate_combined_requirements_hash,
@@ -32,8 +34,10 @@ from .utils import (
     format_conflict,
     get_environment_hash,
     get_installed_versions,
+    included_files,
     major_version_key,
     merge_with_version_policy,
+    module_name_for_path,
     parse_lock_file,
     requirement_names,
     version_satisfies,
@@ -53,6 +57,21 @@ class ResolutionError(RuntimeError):
 
 InstalledPackages = Union[Set[str], Mapping[str, str]]
 
+
+def _not_a_conflict(message: str) -> ResolutionError:
+    """A ResolutionError that resolving modules one by one can't help with (setup/network)."""
+    error = ResolutionError(message)
+    error._not_a_conflict = True
+    return error
+
+
+# pip messages that mean the package index couldn't be reached, not that versions clash.
+_NETWORK_ERROR_MARKERS = (
+    "NewConnectionError", "ConnectTimeoutError", "ReadTimeoutError", "ProxyError", "SSLError",
+    "Max retries exceeded", "Temporary failure in name resolution", "Name or service not known",
+    "Network is unreachable", "Connection refused", "Connection reset",
+)
+
 ON_CONFLICT_RESOLVE = "resolve"
 ON_CONFLICT_FAIL = "fail"
 
@@ -61,14 +80,117 @@ _CONSTRAINTS_KEY = "__constraints__"
 #: Name used for the core constraint files in conflict reports
 CORE_CONSTRAINTS = "core constraints"
 
+try:  # POSIX
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows
+    _fcntl = None
+try:  # Windows
+    import msvcrt as _msvcrt
+except ImportError:
+    _msvcrt = None
+
+
+class _CacheLock:
+    """
+    Serialises work on one cache directory across threads *and* processes.
+
+    Threads in a process share a re-entrant lock. The outermost acquisition also takes
+    an OS file lock on ``<cache_dir>/.lock`` (``flock`` on POSIX, ``msvcrt.locking`` on
+    Windows), so several server workers or parallel CI jobs sharing a cache directory
+    take turns instead of overwriting each other's cache. The file is opened per
+    acquisition, so forked workers never share a lock by accident. If the file system
+    doesn't support locking, ChaCC logs a warning and carries on with the thread lock.
+    """
+
+    def __init__(self, cache_dir: str):
+        self._thread_lock = threading.RLock()
+        self._path = os.path.join(cache_dir, ".lock")
+        self._depth = 0
+        self._fd: Optional[int] = None
+
+    def __enter__(self) -> "_CacheLock":
+        self._thread_lock.acquire()
+        try:
+            if self._depth == 0:
+                self._fd = self._lock_file()
+            self._depth += 1
+        except BaseException:
+            self._thread_lock.release()
+            raise
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        try:
+            self._depth -= 1
+            if self._depth == 0 and self._fd is not None:
+                fd, self._fd = self._fd, None
+                try:
+                    if _fcntl is not None:
+                        _fcntl.flock(fd, _fcntl.LOCK_UN)
+                    elif _msvcrt is not None:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+                os.close(fd)
+        finally:
+            self._thread_lock.release()
+
+    def _lock_file(self) -> Optional[int]:
+        try:
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as e:
+            default_logger.warning(f"Can't create the cache lock file ({e}); other processes are not coordinated")
+            return None
+        try:
+            if self._try_lock(fd, blocking=False):
+                return fd
+            default_logger.info(f"Waiting for another process using the cache in {os.path.dirname(self._path)}...")
+            self._try_lock(fd, blocking=True)
+            return fd
+        except OSError as e:
+            default_logger.warning(f"File locking isn't supported here ({e}); other processes are not coordinated")
+            os.close(fd)
+            return None
+
+    @staticmethod
+    def _try_lock(fd: int, blocking: bool) -> bool:
+        """Take the file lock. Returns False if it's held elsewhere (non-blocking only)."""
+        if _fcntl is not None:
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | (0 if blocking else _fcntl.LOCK_NB))
+                return True
+            except OSError as e:
+                if not blocking and e.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                    return False
+                raise
+        if _msvcrt is not None:
+            while True:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+                    return True
+                except OSError:
+                    if not blocking:
+                        return False
+                    time.sleep(0.1)
+        return True
+
+
 # One lock per cache directory, shared by every DependencyManager pointing at it.
-_CACHE_LOCKS: Dict[str, threading.RLock] = {}
+_CACHE_LOCKS: Dict[str, _CacheLock] = {}
 _CACHE_LOCKS_GUARD = threading.Lock()
 
 
-def _lock_for(cache_dir: str) -> threading.RLock:
+def _lock_for(cache_dir: str) -> _CacheLock:
     with _CACHE_LOCKS_GUARD:
-        return _CACHE_LOCKS.setdefault(cache_dir, threading.RLock())
+        if cache_dir not in _CACHE_LOCKS:
+            _CACHE_LOCKS[cache_dir] = _CacheLock(cache_dir)
+        return _CACHE_LOCKS[cache_dir]
+
+
+_PYTHON_EXCEPTION_LINE = re.compile(r'^[A-Za-z_]\w*(\.\w+)+: ')
 
 
 def _summarize_pip_error(output: str, max_lines: int = 25) -> str:
@@ -83,6 +205,10 @@ def _summarize_pip_error(output: str, max_lines: int = 25) -> str:
             if line[:1].isspace():
                 continue
             in_traceback = False  # first unindented line is the exception message
+        if _PYTHON_EXCEPTION_LINE.match(line):
+            # e.g. "pip._internal.exceptions.DistributionNotFound: ...": repeats pip's own
+            # ERROR line in Python terms.
+            continue
         if line.startswith(("During handling of the above exception", "The above exception was")):
             continue
         if line.strip():
@@ -90,12 +216,25 @@ def _summarize_pip_error(output: str, max_lines: int = 25) -> str:
     return "\n".join(lines[-max_lines:]) or output.strip()[-2000:]
 
 
+def _parse_log_level(level: Union[int, str]) -> int:
+    """``logging.INFO`` / ``20`` / ``"info"`` -> ``20``."""
+    if isinstance(level, bool) or not isinstance(level, (int, str)):
+        raise ValueError(f"log_level must be a logging level number or name, not {level!r}")
+    if isinstance(level, int):
+        return level
+    value = logging.getLevelName(level.strip().upper())
+    if not isinstance(value, int):
+        raise ValueError(f"Unknown log_level {level!r}; use DEBUG, INFO, WARNING, ERROR or CRITICAL")
+    return value
+
+
 class DependencyManager:
     """
     Manages Python package dependencies for modular applications.
 
-    All modules are resolved together in a single pip-compile run, seeded with the
-    previous pins so unchanged packages keep their versions. If modules turn out to be
+    Each resolve checks the passed modules together with every module registered by
+    earlier calls, in one pip-compile run seeded with the previous pins so unchanged
+    packages keep their versions. If modules turn out to be
     incompatible, each module is resolved on its own and the results are merged:
 
     * same major version  -> the latest requested version is used by everyone
@@ -112,7 +251,9 @@ class DependencyManager:
         pre_resolve_hook: Optional callback called before dependency resolution
         post_resolve_hook: Optional callback called after dependency resolution
         install_hook: Optional callback for custom package installation logic. Receives
-            the resolved pins and ``{canonical_name: installed_version}``.
+            the resolved pins (``{name: "==version"}``) and the set of installed package
+            names (canonicalized), as in earlier versions. Return True if it installed
+            everything, False to fall back to pip.
         install_timeout: Timeout in seconds for each pip install attempt (default: 300,
             None disables)
         max_retries: Maximum number of retry attempts for failed package batches (default: 5)
@@ -121,6 +262,11 @@ class DependencyManager:
         constraint_files: Constraint files (pip ``-c`` format) applied to every
             resolution, e.g. your application's core/pinned packages. Modules can
             add packages but cannot move these versions.
+        log_level: Logging level for ChaCC's messages, as a number (``logging.INFO``) or a
+            name (``"INFO"``, ``"warning"``). Applied to ``logger`` (or ChaCC's own
+            ``dependency_manager`` logger when none is passed, which affects every manager
+            using it). Default: None, which leaves the level unchanged (DEBUG for the
+            built-in logger, as in earlier versions).
         on_conflict: ``"resolve"`` (default) applies the version policy above;
             ``"fail"`` raises :class:`ResolutionError` describing the conflicts.
 
@@ -133,12 +279,13 @@ class DependencyManager:
         logger: Optional[logging.Logger] = None,
         pre_resolve_hook: Optional[Callable[[str, str], None]] = None,
         post_resolve_hook: Optional[Callable[[str, Dict[str, str]], None]] = None,
-        install_hook: Optional[Callable[[Dict[str, str], InstalledPackages], bool]] = None,
+        install_hook: Optional[Callable[[Dict[str, str], Set[str]], bool]] = None,
         install_timeout: Optional[int] = 300,
         max_retries: int = 5,
         resolve_timeout: Optional[int] = 600,
         constraint_files: Optional[List[str]] = None,
         on_conflict: str = ON_CONFLICT_RESOLVE,
+        log_level: Optional[Union[int, str]] = None,
     ):
         """Initialize the dependency manager with configurable paths and hooks."""
         if on_conflict not in (ON_CONFLICT_RESOLVE, ON_CONFLICT_FAIL):
@@ -148,6 +295,8 @@ class DependencyManager:
         self.cache_file = os.path.join(self.cache_dir, "dependency_cache.json")
 
         self.logger = logger or default_logger
+        if log_level is not None:
+            self.logger.setLevel(_parse_log_level(log_level))
 
         self.pre_resolve_hook = pre_resolve_hook
         self.post_resolve_hook = post_resolve_hook
@@ -164,7 +313,6 @@ class DependencyManager:
 
         os.makedirs(self.cache_dir, exist_ok=True)
 
-    
     @staticmethod
     def _empty_cache() -> Dict:
         return {
@@ -174,7 +322,6 @@ class DependencyManager:
             'environment_hash': None,
             'resolved_packages': {},
             'conflicts': [],
-            'install_no_deps': False,
             'last_updated': None
         }
 
@@ -216,6 +363,29 @@ class DependencyManager:
                 except IOError as e2:
                     self.logger.error(f"Failed to remove dependency cache file: {e2}")
 
+    def _reset_for_new_environment(self, cache: Dict) -> Dict:
+        """
+        Drop everything resolved for the old environment (Python version, OS, CPU) but
+        keep the registered modules, so modules added one call at a time aren't lost.
+        """
+        if cache.get('environment_hash') in (None, get_environment_hash()):
+            return cache
+        self.logger.info("Environment changed (Python version/OS/architecture), re-resolving every module")
+        fresh = self._empty_cache()
+        for name, entry in cache.get('requirements_caches', {}).items():
+            if 'requirements' in entry:
+                fresh['requirements_caches'][name] = {
+                    'hash': None,
+                    'requirements': entry['requirements'],
+                    'packages': {},
+                    'complete': False,
+                    'order': entry.get('order', 0),
+                    'source': entry.get('source', 'explicit'),
+                    'skipped_packages': [],
+                    'last_updated': entry.get('last_updated'),
+                }
+        return fresh
+
     def invalidate_module_cache(self, module_name: str):
         """Force a module to be re-resolved on the next run (it stays registered)."""
         with self._lock:
@@ -247,33 +417,44 @@ class DependencyManager:
             self.logger.info(f"Module removed: {module_name} (its pins are dropped on the next resolve)")
             return True
 
-    
     def _discover_requirements(
         self,
         requirements_file_pattern: str,
         search_dirs: Optional[List[str]],
     ) -> List[Tuple[str, str]]:
-        requirements_to_process = []
+        found: List[Tuple[str, str]] = []
+        seen_paths: Set[str] = set()
         search_dirs = search_dirs or ["."]
         for base_dir in search_dirs:
             if not os.path.exists(base_dir):
                 continue
             for req_file in sorted(glob.glob(os.path.join(base_dir, requirements_file_pattern))):
+                if os.path.abspath(req_file) in seen_paths:
+                    continue
+                seen_paths.add(os.path.abspath(req_file))
                 try:
                     with open(req_file, 'r') as f:
                         req_content = f.read().strip()
                     if req_content:
-                        req_name = os.path.splitext(os.path.basename(req_file))[0]
-                        requirements_to_process.append((req_name, req_content))
+                        # Paths inside the file are relative to the file, as pip reads them.
+                        req_content = absolutize_requirement_paths(req_content, os.path.dirname(req_file))
+                        found.append((req_file, req_content))
                         self.logger.info(f"Discovered requirements file: {req_file}")
                 except Exception as e:
                     self.logger.warning(f"Failed to read requirements file {req_file}: {e}")
 
-        if not requirements_to_process:
+        if not found:
             self.logger.info(
                 f"No requirements files found matching pattern: {requirements_file_pattern} in {search_dirs}"
             )
-        return requirements_to_process
+        # Modules are named after the file, as in earlier versions. Files that share a
+        # name (e.g. several requirements.txt in different folders) get their relative
+        # path instead, so none of them is dropped.
+        short_names = [module_name_for_path(path, short=True) for path, _ in found]
+        return [
+            (short if short_names.count(short) == 1 else module_name_for_path(path), content)
+            for short, (path, content) in zip(short_names, found)
+        ]
 
     def _effective_requirements(
         self,
@@ -282,25 +463,35 @@ class DependencyManager:
         requirements_file_pattern: str,
         search_dirs: Optional[List[str]],
         replace: bool,
+        prune: bool = True,
     ) -> Tuple[List[Tuple[str, str]], Dict[str, Dict]]:
         """
         Work out the full set of modules to resolve, in precedence order.
 
+        * explicit modules are added to the registered ones (``replace=True``: they are
+          the complete set)
+        * discovered files are the complete set of discovered modules, so a deleted
+          file counts as removed. Explicit modules are kept. With ``prune=False``
+          (upgrades), or when no file is found at all, no registered module is dropped.
+
         Returns ``(requirements, meta)`` where ``meta[name]`` holds ``order`` and ``source``.
         """
+        registered = {n: e for n, e in req_caches.items() if 'requirements' in e}
         if modules_requirements:
-            incoming, source = list(modules_requirements.items()), 'explicit'
-            keep = {} if replace else {
-                n: e for n, e in req_caches.items() if 'requirements' in e and n not in modules_requirements
-            }
+            # Relative paths in passed-in text (-r/-c/-e/./local) are relative to the
+            # current folder; they're made absolute because pip-compile runs elsewhere.
+            incoming = [(n, absolutize_requirement_paths(c, os.getcwd())) for n, c in modules_requirements.items()]
+            source = 'explicit'
+            keep = {} if replace else {n: e for n, e in registered.items() if n not in modules_requirements}
         else:
             incoming, source = self._discover_requirements(requirements_file_pattern, search_dirs), 'discovered'
-            if not incoming:
-                return [], {}
             names = {n for n, _ in incoming}
+            if not incoming and registered:
+                # Most likely run from the wrong folder: don't drop what's registered.
+                self.logger.info(f"Using the {len(registered)} registered module(s)")
             keep = {
-                n: e for n, e in req_caches.items()
-                if 'requirements' in e and e.get('source') == 'explicit' and n not in names
+                n: e for n, e in registered.items()
+                if n not in names and (not prune or not incoming or e.get('source') == 'explicit')
             }
 
         next_order = max([e.get('order', 0) for e in req_caches.values()] + [0]) + 1
@@ -320,14 +511,22 @@ class DependencyManager:
         ordered = sorted(contents, key=lambda n: (meta[n]['order'], n))
         return [(name, contents[name]) for name in ordered], meta
 
+    @staticmethod
+    def _module_hash(name: str, content: str) -> str:
+        # Files included with -r/-c count as part of the module: editing a shared
+        # base.txt must re-resolve every module that includes it.
+        files = included_files(content)
+        if files:
+            content = f"{content}\n#included:{calculate_files_hash(files)}"
+        return calculate_module_hash(name, content)
+
     def _requirement_hashes(self, requirements: List[Tuple[str, str]]) -> Tuple[Dict[str, str], str]:
-        module_hashes = {name: calculate_module_hash(name, content) for name, content in requirements}
+        module_hashes = {name: self._module_hash(name, content) for name, content in requirements}
         hashes_for_combined = dict(module_hashes)
         if self.constraint_files:
             hashes_for_combined[_CONSTRAINTS_KEY] = calculate_files_hash(self.constraint_files)
         return module_hashes, calculate_combined_requirements_hash(hashes_for_combined)
 
-    
     def _run_pre_hooks(self, requirements: List[Tuple[str, str]]):
         if not self.pre_resolve_hook:
             return
@@ -370,7 +569,7 @@ class DependencyManager:
         constraint_files = self.constraint_files if use_constraints else []
         missing = [p for p in constraint_files if not os.path.isfile(p)]
         if missing:
-            raise ResolutionError(f"Constraint file(s) not found: {', '.join(missing)}")
+            raise _not_a_conflict(f"Constraint file(s) not found: {', '.join(missing)}")
 
         names = ', '.join(name for name, _ in non_empty)
         self.logger.info(f"{action} dependencies for {len(non_empty)} module(s) together: {names}")
@@ -420,16 +619,23 @@ class DependencyManager:
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.resolve_timeout)
             except subprocess.TimeoutExpired:
-                raise ResolutionError(
+                raise _not_a_conflict(
                     f"pip-compile timed out after {self.resolve_timeout}s while {action.lower()} "
                     f"[{names}]; raise --resolve-timeout / resolve_timeout if this is expected"
                 )
             except OSError as e:
-                raise ResolutionError(f"Could not run pip-compile: {e}")
+                raise _not_a_conflict(f"Could not run pip-compile: {e}")
 
             if result.returncode != 0:
-                details = _summarize_pip_error(result.stderr or result.stdout or "unknown error")
+                raw = result.stderr or result.stdout or "unknown error"
+                details = _summarize_pip_error(raw)
                 verb = "upgrade" if upgrade else "resolve"
+                if any(marker in raw for marker in _NETWORK_ERROR_MARKERS):
+                    raise _not_a_conflict(
+                        f"Failed to {verb} dependencies for [{names}]: the package index could not be "
+                        f"reached (network or index problem, not a dependency conflict). "
+                        f"Nothing was changed; try again later.\n{details}"
+                    )
                 raise ResolutionError(f"Failed to {verb} dependencies for [{names}]:\n{details}")
 
             with open(output_path, 'r') as f:
@@ -470,7 +676,7 @@ class DependencyManager:
         except ResolutionError as combined_error:
             non_empty = [(n, c) for n, c in requirements if c.strip()]
             message = str(combined_error)
-            if message.startswith(("Constraint file", "Could not run", "pip-compile timed out")):
+            if getattr(combined_error, '_not_a_conflict', False):
                 raise
             if len(non_empty) < 2 and not self.constraint_files:
                 raise
@@ -534,6 +740,8 @@ class DependencyManager:
                                     upgrade_packages=upgrade_packages)
             return pins
         except ResolutionError as with_constraints:
+            if getattr(with_constraints, '_not_a_conflict', False):
+                raise
             if not self.constraint_files:
                 raise ResolutionError(
                     f"Module '{name}' cannot be resolved even on its own, so this is not a "
@@ -544,6 +752,8 @@ class DependencyManager:
             pins, _ = self._compile([(name, content)], upgrade=upgrade, seed_pins=seed,
                                     use_constraints=False, upgrade_packages=upgrade_packages)
         except ResolutionError as e:
+            if getattr(e, '_not_a_conflict', False):
+                raise
             raise ResolutionError(
                 f"Module '{name}' cannot be resolved even on its own, so this is not a "
                 f"conflict between modules. Fix its requirements:\n{e}",
@@ -597,6 +807,7 @@ class DependencyManager:
         ``raise_on_error=True`` to get a :class:`ResolutionError` instead, which lets you
         tell a failure apart from "no dependencies".
         """
+        requirements_content = absolutize_requirement_paths(requirements_content, os.getcwd())
         self._run_pre_hooks([(module_name, requirements_content)])
         try:
             pins, _ = self._compile([(module_name, requirements_content)], upgrade=upgrade)
@@ -622,7 +833,10 @@ class DependencyManager:
                 if package_name in merged:
                     existing_version = merged[package_name]
                     if version_spec != existing_version:
-                        self.logger.warning(f"Version conflict for {package_name}: {existing_version} vs {version_spec}, using {version_spec}")
+                        self.logger.warning(
+                            f"Version conflict for {package_name}: {existing_version} vs {version_spec}, "
+                            f"using {version_spec}"
+                        )
                 merged[package_name] = version_spec
 
         return merged
@@ -827,7 +1041,6 @@ class DependencyManager:
             'environment_hash': get_environment_hash(),
             'resolved_packages': pins,
             'conflicts': conflicts,
-            'install_no_deps': bool(conflicts),
             'last_updated': now,
         }
 
@@ -850,6 +1063,7 @@ class DependencyManager:
         search_dirs: Optional[List[str]] = None,
         install: bool = True,
         replace: bool = False,
+        dry_run: bool = False,
     ) -> Dict[str, str]:
         """
         Blocking version of :meth:`resolve_dependencies`. Returns the resolved pins.
@@ -862,17 +1076,14 @@ class DependencyManager:
         3. If they conflict, applies the version policy (see the class docstring)
         4. Saves the cache only after a successful resolution
         5. Installs packages that are missing or at the wrong version (unless install=False)
+
+        ``dry_run=True`` resolves and returns the pins without saving anything to the
+        cache (so the passed modules are not registered) and without installing.
         """
         with self._lock:
             self.logger.info("Starting incremental dependency resolution...")
             try:
-                cache = self.load_cache()
-                current_env_hash = get_environment_hash()
-                cached_env_hash = cache.get('environment_hash')
-                if cached_env_hash and cached_env_hash != current_env_hash:
-                    self.logger.info("Environment changed (Python version/OS/architecture), invalidating cache")
-                    self.invalidate_cache()
-                    cache = self.load_cache()
+                cache = self._reset_for_new_environment(self.load_cache())
 
                 req_caches = cache.get('requirements_caches', {})
                 requirements, meta = self._effective_requirements(
@@ -905,11 +1116,14 @@ class DependencyManager:
                         requirements, upgrade=False, seed_pins=cached_pins,
                         req_caches=req_caches, changed=changed,
                     )
-                    self.save_cache(self._build_cache(
-                        requirements, meta, module_hashes, combined_hash, pins, per_module,
-                        conflicts, backbone_hash=cache.get('backbone_hash'),
-                    ))
-                    self.logger.info("💾 Cache updated: New dependency resolution results saved")
+                    if dry_run:
+                        self.logger.info("Dry run: the cache was not changed")
+                    else:
+                        self.save_cache(self._build_cache(
+                            requirements, meta, module_hashes, combined_hash, pins, per_module,
+                            conflicts, backbone_hash=cache.get('backbone_hash'),
+                        ))
+                        self.logger.info("💾 Cache updated: New dependency resolution results saved")
                 else:
                     pins = cached_pins
                     conflicts = cache.get('conflicts', [])
@@ -919,12 +1133,13 @@ class DependencyManager:
                             self.logger.warning(f"⚠️  Unresolved major-version conflict on {format_conflict(conflict)}")
 
                 self.last_conflicts = conflicts
-                if install:
+                if install and not dry_run:
                     self._install(pins, no_deps=bool(conflicts))
                 return pins
 
             except Exception as e:
-                self.logger.error(f"Error during dependency resolution: {e}", exc_info=not isinstance(e, ResolutionError))
+                self.logger.error(f"Error during dependency resolution: {e}",
+                                  exc_info=not isinstance(e, ResolutionError))
                 raise
 
     async def resolve_dependencies(
@@ -934,6 +1149,7 @@ class DependencyManager:
         search_dirs: Optional[List[str]] = None,
         install: bool = True,
         replace: bool = False,
+        dry_run: bool = False,
     ) -> Dict[str, str]:
         """
         Perform incremental dependency resolution for requirements.
@@ -950,6 +1166,8 @@ class DependencyManager:
             install: Install missing/outdated packages after resolving (default: True)
             replace: Treat ``modules_requirements`` as the complete module set, dropping
                      other cached modules (default: False)
+            dry_run: Resolve and return the pins without saving the cache or installing
+                     (default: False)
 
         Raises:
             ResolutionError: resolution failed (cache left untouched)
@@ -958,7 +1176,7 @@ class DependencyManager:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, functools.partial(
             self.resolve_dependencies_sync,
-            modules_requirements, requirements_file_pattern, search_dirs, install, replace
+            modules_requirements, requirements_file_pattern, search_dirs, install, replace, dry_run
         ))
 
     def upgrade_dependencies_sync(
@@ -971,12 +1189,12 @@ class DependencyManager:
         with self._lock:
             self.logger.info("Starting dependency upgrade...")
             try:
-                cache = self.load_cache()
+                cache = self._reset_for_new_environment(self.load_cache())
                 req_caches = cache.get('requirements_caches', {})
-                if cache.get('environment_hash') not in (None, get_environment_hash()):
-                    req_caches = {}
+                # Upgrading never unregisters modules, even ones not discovered this time.
                 requirements, meta = self._effective_requirements(
-                    req_caches, modules_requirements, requirements_file_pattern, search_dirs, replace=False
+                    req_caches, modules_requirements, requirements_file_pattern, search_dirs,
+                    replace=False, prune=False,
                 )
                 if not requirements:
                     return {}
@@ -990,7 +1208,9 @@ class DependencyManager:
                     for name, content in modules_requirements.items():
                         targets.extend(requirement_names(content))
                         targets.extend(req_caches.get(name, {}).get('packages', {}))
-                    self.logger.info(f"Upgrading {len(set(targets))} package(s) from: {', '.join(modules_requirements)}")
+                    self.logger.info(
+                        f"Upgrading {len(set(targets))} package(s) from: {', '.join(modules_requirements)}"
+                    )
                     pins, per_module, conflicts = self._resolve_set(
                         requirements, upgrade=False, seed_pins=cache.get('resolved_packages') or {},
                         req_caches=req_caches, changed=list(modules_requirements),
