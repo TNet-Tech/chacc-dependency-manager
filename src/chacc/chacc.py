@@ -31,7 +31,7 @@ Example:
     await dm.resolve_dependencies()
 """
 
-from .manager import DependencyManager
+from .manager import DependencyManager, ResolutionError
 from .utils import (
     calculate_module_hash,
     calculate_combined_requirements_hash,
@@ -49,9 +49,12 @@ class Config:
     logger: Optional[logging.Logger] = None
     pre_resolve_hook: Optional[Callable[[str, str], None]] = None
     post_resolve_hook: Optional[Callable[[str, Dict[str, str]], None]] = None
-    install_hook: Optional[Callable[[Dict[str, str], Set[str]], bool]] = None
-    install_timeout: int = 60
+    install_hook: Optional[Callable[[Dict[str, str], Dict[str, str]], bool]] = None
+    install_timeout: Optional[int] = 300
     max_retries: int = 5
+    resolve_timeout: Optional[int] = 600
+    constraint_files: Optional[List[str]] = None
+    on_conflict: str = "resolve"
 
     def create_manager(self) -> DependencyManager:
         """Create a DependencyManager with this configuration."""
@@ -62,7 +65,10 @@ class Config:
             post_resolve_hook=self.post_resolve_hook,
             install_hook=self.install_hook,
             install_timeout=self.install_timeout,
-            max_retries=self.max_retries
+            max_retries=self.max_retries,
+            resolve_timeout=self.resolve_timeout,
+            constraint_files=self.constraint_files,
+            on_conflict=self.on_conflict
         )
 
 
@@ -116,9 +122,15 @@ def invalidate_dependency_cache(config: Optional[Config] = None):
 
 
 def invalidate_module_cache(module_name: str, config: Optional[Config] = None):
-    """Invalidate cache for a specific module."""
+    """Force a module to be re-resolved on the next run."""
     dm = config.create_manager() if config else dependency_manager
     dm.invalidate_module_cache(module_name)
+
+
+def remove_module(module_name: str, config: Optional[Config] = None) -> bool:
+    """Unregister a module; its pins are dropped on the next resolve (nothing is uninstalled)."""
+    dm = config.create_manager() if config else dependency_manager
+    return dm.remove_module(module_name)
 
 
 async def re_resolve_dependencies(
@@ -127,6 +139,11 @@ async def re_resolve_dependencies(
     search_dirs: Optional[List[str]] = None,
     config: Optional[Config] = None
 ):
-    """Re-resolve and reinstall all dependencies with full caching support."""
+    """
+    Re-resolve and reinstall all dependencies with full caching support.
+
+    Runs the blocking pip work in a worker thread, so it is safe to await from an
+    async server. Returns the resolved pins.
+    """
     dm = config.create_manager() if config else dependency_manager
-    await dm.resolve_dependencies(modules_requirements, requirements_file_pattern, search_dirs)
+    return await dm.resolve_dependencies(modules_requirements, requirements_file_pattern, search_dirs)

@@ -5,12 +5,13 @@ This package provides incremental dependency resolution, caching, and intelligen
 package installation for modular Python applications.
 """
 
-from .manager import DependencyManager
+from .manager import DependencyManager, ResolutionError
 from .chacc import (
     Config,
     re_resolve_dependencies,
     invalidate_dependency_cache,
     invalidate_module_cache,
+    remove_module,
     calculate_module_hash,
     load_dependency_cache,
     save_dependency_cache,
@@ -20,16 +21,18 @@ from .chacc import (
     install_missing_packages,
 )
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __author__ = "Jonas G Mwambimbi"
 __email__ = "jonasgeorge1015@gmail.com"
 
 __all__ = [
     "Config",
     "DependencyManager",
+    "ResolutionError",
     "re_resolve_dependencies",
     "invalidate_dependency_cache",
     "invalidate_module_cache",
+    "remove_module",
     "calculate_module_hash",
     "load_dependency_cache",
     "save_dependency_cache",

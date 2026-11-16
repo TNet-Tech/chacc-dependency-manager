@@ -89,7 +89,12 @@ cdm install -r requirements-dev.txt
 
 # Install specific packages
 cdm install fastapi uvicorn sqlalchemy
+
+# Auto-discover with a custom pattern and directories
+cdm install -p "requirements-*.txt" --search-dirs services/api services/worker
 ```
+
+Requirements are remembered between runs. Packages passed on the command line are kept as a module named `cli`, and a `-r` file is registered under its file name without the extension (`requirements-dev`), which is the same name auto-discovery uses. To stop managing them, run `cdm cache --remove --module cli`.
 
 #### **Upgrading Dependencies**
 
@@ -97,12 +102,15 @@ cdm install fastapi uvicorn sqlalchemy
 # Auto-discover and upgrade all packages in requirements files
 cdm upgrade
 
-# Upgrade from a specific requirements file
+# Add a requirements file, then upgrade
 cdm upgrade -r requirements-dev.txt
 
-# Upgrade specific packages
+# Add packages (to the `cli` module), then upgrade
 cdm upgrade requests fastapi
 ```
+
+With no arguments, `cdm upgrade` upgrades **every registered module** to the newest versions that work together. With `-r FILE` or package names, only those packages are upgraded, and every other module keeps its pinned versions. Both use the same conflict policy as install.
+
 
 #### **Managing the Cache**
 
@@ -113,13 +121,16 @@ cdm cache --info
 # Clear the entire cache
 cdm cache --clear
 
-# Clear the cache for a specific module
+# Force one module to be re-resolved on the next install
 cdm cache --clear --module auth
+
+# Unregister a module (its pins are dropped on the next install; nothing is uninstalled)
+cdm cache --remove --module auth
 ```
 
 #### **Resolving Dependencies Without Installing**
 
-You can see what ChaCC Dependency Manager *would* install without actually installing the packages.
+You can see what ChaCC Dependency Manager *would* install without actually installing the packages. `cdm resolve` is a dry run: it prints the resolved pins and how many packages would be installed or changed. The result is cached, so a later `cdm install` doesn't resolve again.
 
 ```bash
 # Check what would be installed from requirements.txt
@@ -127,11 +138,16 @@ cdm resolve
 
 # Check for a specific file
 cdm resolve -r requirements-dev.txt
+
+# Print the resolved pins, then install them
+cdm resolve --install
 ```
+
+> In 1.3.0, `cdm resolve` also installed packages. Use `cdm resolve --install` (or `cdm install`) for that behavior.
 
 #### **Checking Package Installation Status**
 
-Verify that cached packages are actually installed and match expectations.
+Verify that cached packages are installed at the resolved versions. Missing packages, version mismatches and [major-version conflicts](#handling-conflicts-between-modules) are all reported.
 
 ```bash
 # Check if all cached packages are properly installed
@@ -217,6 +233,7 @@ ChaCC Dependency Manager's primary advantage is its intelligent caching. On the 
 *   **Smart Caching**: Only re-installs dependencies that have changed.
 *   **Incremental Updates**: Avoids full reinstalls, saving significant time.
 *   **Multi-File Support**: Handles complex projects with multiple `requirements.txt` files.
+*   **Conflict Handling**: Modules share one set of versions. Same-major conflicts use the latest version, and different-major conflicts are skipped and flagged without blocking the module.
 *   **Docker-Optimized**: Works seamlessly with Docker's layer caching for faster image builds.
 *   **Package Validation**: Verifies that cached packages are still installed correctly.
 *   **Debug Logging**: Provides detailed output to help you understand caching behavior.
@@ -275,7 +292,88 @@ You can use caching in your CI/CD pipelines to persist the ChaCC Dependency Mana
 *   `"*.txt"`
 *   `"requirements-*.txt"`
 
-ChaCC Dependency Manager will search for these files in the current directory or a specified `modules_dir`.
+ChaCC Dependency Manager will search for these files in the current directory, or in the directories given by `search_dirs` (`cdm resolve --search-dirs ...`). Each file becomes a module named after the file without its extension. The discovered files are the complete set: if a file disappears, its pins are dropped on the next run. Modules added explicitly (in code, with `-r`, or as command-line packages) are kept.
+
+### Protecting Core Packages with Constraints
+
+Each resolve checks every registered requirements file or module jointly, whether they were passed in the same call or in earlier ones, so they share a single, consistent set of versions. See [Handling Conflicts Between Modules](#handling-conflicts-between-modules) for what happens when they can't agree.
+
+To stop modules from changing the versions your application depends on, pass those pins as **constraints** (pip `-c` format). A module can add packages, but it can't move a constrained version:
+
+```bash
+# core-constraints.txt contains lines like: fastapi==0.115.0
+cdm -c core-constraints.txt install
+```
+
+```python
+dm = DependencyManager(constraint_files=["core-constraints.txt"])
+# or
+config = Config(constraint_files=["core-constraints.txt"])
+```
+
+Editing a constraints file triggers a new resolve on the next run. Constraints always win a conflict, even within the same major version.
+
+### Handling Conflicts Between Modules
+
+If modules can't all be satisfied together, ChaCC resolves each one on its own and settles each package that differs:
+
+| Situation | Example | Result |
+| :--- | :--- | :--- |
+| Same major version | auth wants `urllib3 1.26.9`, payments wants `1.26.20` | Everyone gets the **latest**, `1.26.20` |
+| Different major version | auth wants `urllib3 1.26.20`, payments wants `2.8.0` | The existing module's `1.26.20` is kept. payments' requirement is **skipped and flagged**, and payments still loads. |
+| Core constraint involved | core pins `urllib3==1.26.5` | The core version always wins |
+
+For `0.x` packages the minor version counts as the major (`0.9` → `0.10` is a major change), following semver. "Existing" means the module registered first. Every adjustment is logged:
+
+```
+WARNING: ⚠️  Dependency conflict on 'urllib3': auth wants 1.26.20, payments wants 2.8.0. Major versions differ,
+so 1.26.20 (from auth) is kept and the requirement from payments is skipped. payments may not work correctly
+```
+
+Conflicts are saved in the cache and shown by `cdm check` and `cdm cache --info`, which also lists each module's skipped packages. Major-version conflicts are warned about again on every run until the requirements change. In code they're available as `dm.last_conflicts`, a list of dicts with `package`, `chosen`, `chosen_from`, `requested` (module → version), `kind` (`"minor"` or `"major"`) and `skipped_modules`.
+
+After a merge, packages are installed exactly as pinned (`pip install --no-deps`), because the merged versions deliberately break some declared requirements. Any requirements left unmet (from `pip check`) are logged as warnings. Only new or changed modules are resolved again when a conflict happens; unchanged ones reuse their cached package set.
+
+To stop on conflicts instead, use `on_conflict="fail"` / `--on-conflict fail`. ChaCC then raises `ResolutionError` naming each package, module and version, and leaves the cache untouched. The error's `.conflicts` holds the same dicts as `last_conflicts`. A module that can't resolve even on its own (for example a misspelled package) always raises `ResolutionError`, with `.module` set to that module.
+
+### Using ChaCC from an Async Server
+
+`resolve_dependencies()`, `upgrade_dependencies()` and `re_resolve_dependencies()` run pip in a worker thread, so awaiting them doesn't block the event loop. Calls that use the same cache directory run one at a time, even through separate `DependencyManager` or `Config` instances in the same process. Separate processes (for example several server workers) sharing one cache directory are **not** coordinated, so give each its own cache directory or run installs from one process. In scripts, use the blocking `resolve_dependencies_sync()` / `upgrade_dependencies_sync()` instead of `asyncio.run(...)`.
+
+```python
+from chacc import DependencyManager, ResolutionError
+
+dm = DependencyManager()
+
+async def on_module_uploaded(name: str, requirements: str):
+    try:
+        # Additive: modules registered by earlier calls stay part of the set
+        await dm.resolve_dependencies({name: requirements})
+    except ResolutionError as e:
+        # The module can't be resolved even on its own (or on_conflict="fail");
+        # the cache is untouched and the next run retries
+        log.error(str(e))
+    for conflict in dm.last_conflicts:
+        if conflict["kind"] == "major":
+            log.warning(f"{name}: skipped {conflict['package']}")
+
+async def on_module_deleted(name: str):
+    dm.remove_module(name)            # its pins are dropped on the next resolve
+    await dm.resolve_dependencies()   # nothing is uninstalled
+```
+
+Modules can be passed one per call (for example from an upload handler, or in a loop) or all in a single call. Each call resolves the passed modules **together with every module registered earlier**, so each new module is checked against all the others, and the end result is the same either way:
+
+```python
+# One at a time: each call adds a module
+for name, requirements in modules.items():
+    dm.resolve_dependencies_sync({name: requirements})
+
+# All at once: same pins and conflict outcome, with a single resolve
+dm.resolve_dependencies_sync(modules)
+```
+
+The loop does one resolve per module, so when you already have every module up front, a single call is faster. With both styles, modules registered earlier win major-version conflicts (dict order counts as registration order in a single call). Pass `replace=True` to make a call the complete module set. Auto-discovered requirement files are always the complete set of discovered files.
 
 ### Custom Hooks for Deeper Integration
 
@@ -283,7 +381,9 @@ For advanced use cases, you can inject your own logic into the resolution proces
 
 *   `pre_resolve_hook`: A function that runs *before* dependencies are resolved.
 *   `post_resolve_hook`: A function that runs *after* dependencies are resolved.
-*   `install_hook`: A function to handle the installation of packages, allowing you to override the default installation logic.
+*   `install_hook`: A function to handle the installation of packages, allowing you to override the default installation logic. It receives the resolved pins and the set of installed package names (canonicalized), and returns `True` if it handled the install. Use `chacc.utils.get_installed_versions()` if you need the installed versions.
+
+The pre- and post-resolve hooks are called once per module. `post_resolve_hook` receives the packages that module pulls in, directly or through dependencies. When the async methods are used, hooks run in a worker thread, so don't touch event-loop objects from inside them.
 
 ```python
 def log_start(module_name, requirements):
@@ -311,8 +411,11 @@ class Config:
     pre_resolve_hook: Optional[Callable] = None
     post_resolve_hook: Optional[Callable] = None
     install_hook: Optional[Callable] = None
-    install_timeout: int = 60
+    install_timeout: Optional[int] = 300       # per pip install attempt; None disables
     max_retries: int = 5
+    resolve_timeout: Optional[int] = 600       # per pip-compile run; None disables
+    constraint_files: Optional[List[str]] = None
+    on_conflict: str = "resolve"               # or "fail"
 ```
 
 #### `DependencyManager` Class
@@ -327,18 +430,56 @@ class DependencyManager:
         pre_resolve_hook: Optional[Callable] = None,
         post_resolve_hook: Optional[Callable] = None,
         install_hook: Optional[Callable] = None,
-        install_timeout: int = 60,
-        max_retries: int = 5
+        install_timeout: Optional[int] = 300,
+        max_retries: int = 5,
+        resolve_timeout: Optional[int] = 600,
+        constraint_files: Optional[List[str]] = None,
+        on_conflict: str = "resolve"
     )
 ```
 
 ```python
 class DependencyManager:
-    async def resolve_dependencies(self, ...): ...
-    async def upgrade_dependencies(self, ...): ...
+    async def resolve_dependencies(self, ..., install=True, replace=False) -> Dict[str, str]: ...
+    def resolve_dependencies_sync(self, ..., install=True, replace=False) -> Dict[str, str]: ...
+    async def upgrade_dependencies(self, ...) -> Dict[str, str]: ...
+    def upgrade_dependencies_sync(self, ...) -> Dict[str, str]: ...
     def invalidate_cache(self): ...
-    def invalidate_module_cache(self, module_name: str): ...
-    def install_missing_packages(self, resolved_packages, installed_packages): ...
+    def invalidate_module_cache(self, module_name: str): ...  # force re-resolve
+    def remove_module(self, module_name: str) -> bool: ...    # unregister
+    last_conflicts: List[Dict]                               # conflicts from the last run
+    def install_missing_packages(self, resolved_packages, installed_packages, no_deps=False): ...
+    @staticmethod
+    def packages_needing_install(resolved_packages, installed_versions): ...  # (missing, wrong_version, ok)
+```
+
+`resolve_module_dependencies(module_name, requirements, upgrade=False, raise_on_error=False)` resolves one module without caching. It returns `{}` on failure unless `raise_on_error=True`.
+
+Module-level helpers mirror these and accept `config=`: `re_resolve_dependencies()`, `invalidate_dependency_cache()`, `invalidate_module_cache()` and `remove_module()`.
+
+Resolution failures raise `chacc.ResolutionError` (with `.conflicts` and `.module`). pip install failures (after all retries) raise `subprocess.CalledProcessError`.
+
+## Recent Updates (v1.4.0)
+
+This release fixes how packages are resolved, cached and installed. See [CHANGELOG.md](CHANGELOG.md) for the full list.
+
+> **Upgrade note:** the first run after upgrading clears the cache once and does a full resolve, because the environment hash changed.
+
+- **Failed resolutions are no longer cached.** A failure raises `ResolutionError` and leaves the cache untouched, so the next run tries again.
+- **Version-aware installs.** Packages installed at a different version from the resolved pin are reinstalled, so upgrades are applied. `cdm check` reports version mismatches.
+- **One combined resolve, with a conflict policy.** All modules are resolved together. When they can't agree: same major version → the latest is used; different major → the existing version is kept and the newcomer's requirement is skipped and flagged, without blocking the module. Use `-c/--constraint` to protect core packages.
+- **Modules can arrive one at a time.** Explicit modules add to the set. `remove_module()` / `cdm cache --remove --module` unregisters one.
+- **Upgrades apply.** `cdm upgrade` upgrades every registered module. `cdm upgrade PKG` / `-r FILE` upgrades only those packages and leaves other modules' pins alone.
+- **Compatible with 1.3.0.** Existing CLI commands and Python calls keep working. The main difference: a resolution failure now raises `ResolutionError` (and `cdm` exits with status 1) instead of being cached as an empty result.
+- **No stale pins.** Removing a module or a discovered requirements file drops its pins from the cache.
+- **Non-blocking async API.** pip runs in a worker thread, so async servers stay responsive.
+- **Timeouts.** pip-compile has a timeout (`--resolve-timeout`, default 600s). The pip install timeout default is back to 300s per attempt.
+- **Install location is logged.** A fallback to a user install is reported as a warning.
+- **Stable cache.** The environment hash no longer includes the host kernel version, so host updates don't clear the cache.
+- **`cdm resolve` is a dry run.** It prints what would be installed. `cdm resolve --install` also installs (the 1.3.0 behavior), and `cdm install` now accepts `-p/--pattern` and `--search-dirs`.
+
+```bash
+cdm --resolve-timeout 900 --timeout 600 -c core-constraints.txt install
 ```
 
 ## Recent Updates (v1.3.0)
@@ -349,13 +490,13 @@ This release adds robust retry logic and configurable timeouts for package insta
 
 Package installation now retries failed pip install attempts with exponential backoff:
 
-- **Default timeout**: 60 seconds per pip install attempt
+- **Default timeout**: 60 seconds per pip install attempt (raised to 300 seconds in v1.4.0)
 - **Default retries**: 5 attempts per package batch
 - **Backoff**: Exponential (1s, 2s, 4s, 8s, 16s, capped at 30s)
 
 Configure via CLI:
 ```bash
-cdm install --timeout 120 --max-retries 10
+cdm --timeout 120 --max-retries 10 install
 ```
 
 Or programmatically via the Config object or DependencyManager constructor:
@@ -368,11 +509,13 @@ asyncio.run(re_resolve_dependencies(config=config))
 dm = DependencyManager(install_timeout=120, max_retries=10)
 ```
 
-The resolution phase (`piptools compile`) runs without a timeout. Only the pip install phase uses the configurable timeout and retry logic.
+In v1.3.0 the resolution phase (`piptools compile`) ran without a timeout. Since v1.4.0 it is limited by `--resolve-timeout` / `resolve_timeout` (default 600s).
 
 ## Recent Updates (v1.2.0)
 
 This major release introduces a complete API overhaul, advanced module-based caching, and comprehensive improvements to user experience and performance.
+
+> Module resolution changed in v1.4.0: modules are now resolved together rather than independently. See [Recent Updates (v1.4.0)](#recent-updates-v140).
 
 ### Major New Features
 
@@ -468,7 +611,6 @@ cdm demo cache       # Show cache structure
 
 ## Future Enhancements
 
-*   **Parallel Resolution**: Resolve dependencies for multiple modules at the same time.
 *   **Dependency Graph Visualization**: Create visual representations of your project's dependencies.
 *   **Security Scanning**: Integrate with vulnerability scanners to check your dependencies.
 

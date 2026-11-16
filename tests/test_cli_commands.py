@@ -51,7 +51,7 @@ def test_cmd_check_all_packages_installed():
 
         args = MockArgs(cache_dir=temp_dir)
 
-        with patch('chacc.utils.get_installed_packages', return_value={'requests', 'packaging'}), \
+        with patch('chacc.utils.get_installed_versions', return_value={'requests': '2.28.0', 'packaging': '21.3'}), \
              patch('builtins.print') as mock_print:
 
             cmd_check(args)
@@ -76,7 +76,7 @@ def test_cmd_check_missing_packages():
 
         args = MockArgs(cache_dir=temp_dir)
 
-        with patch('chacc.utils.get_installed_packages', return_value={'requests', 'packaging'}), \
+        with patch('chacc.utils.get_installed_versions', return_value={'requests': '2.28.0', 'packaging': '21.3'}), \
              patch('builtins.print') as mock_print:
 
             cmd_check(args)
@@ -100,7 +100,7 @@ def test_cmd_check_with_extra_packages():
 
         args = MockArgs(cache_dir=temp_dir, all=True)
 
-        with patch('chacc.utils.get_installed_packages', return_value={'requests', 'extra-package'}), \
+        with patch('chacc.utils.get_installed_versions', return_value={'requests': '2.28.0', 'extra-package': '1.0'}), \
              patch('builtins.print') as mock_print:
 
             cmd_check(args)

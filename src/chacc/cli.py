@@ -5,12 +5,14 @@ Provides pip-like commands for dependency management with intelligent caching.
 """
 
 import argparse
-import asyncio
 import sys
 import logging
 from pathlib import Path
 
 from .chacc import DependencyManager
+from .utils import (
+    canonicalize_name, base_package_name, format_conflict, get_installed_versions, version_satisfies
+)
 
 
 def setup_logging(verbose: bool = False):
@@ -22,54 +24,77 @@ def setup_logging(verbose: bool = False):
     )
 
 
+def _make_manager(args) -> DependencyManager:
+    """Build a DependencyManager from the global CLI options."""
+    resolve_timeout = getattr(args, 'resolve_timeout', 600)
+    install_timeout = getattr(args, 'timeout', 300)
+    return DependencyManager(
+        cache_dir=args.cache_dir,
+        install_timeout=install_timeout if install_timeout and install_timeout > 0 else None,
+        max_retries=getattr(args, 'max_retries', 5),
+        resolve_timeout=resolve_timeout if resolve_timeout and resolve_timeout > 0 else None,
+        constraint_files=getattr(args, 'constraint', None),
+        on_conflict=getattr(args, 'on_conflict', 'resolve'),
+    )
+
+
 def cmd_install(args):
     """Install packages with dependency resolution."""
     setup_logging(args.verbose)
 
-    dm = DependencyManager(
-        cache_dir=args.cache_dir,
-        install_timeout=args.timeout,
-        max_retries=args.max_retries
-    )
+    dm = _make_manager(args)
 
     if args.requirements:
         print(f"Installing from {args.requirements}...")
-        requirements = {args.requirements: Path(args.requirements).read_text()}
-        asyncio.run(dm.resolve_dependencies(requirements))
+        requirements = {Path(args.requirements).stem: Path(args.requirements).read_text()}
+        dm.resolve_dependencies_sync(requirements)
     elif args.packages:
         print(f"Installing packages: {', '.join(args.packages)}...")
         requirements = {"cli": "\n".join(args.packages)}
-        asyncio.run(dm.resolve_dependencies(requirements))
+        dm.resolve_dependencies_sync(requirements)
     else:
         print("Auto-discovering and installing requirements...")
-        asyncio.run(dm.resolve_dependencies())
+        dm.resolve_dependencies_sync(
+            requirements_file_pattern=getattr(args, 'pattern', 'requirements.txt'),
+            search_dirs=getattr(args, 'search_dirs', None),
+        )
 
     print("✅ Installation completed")
 
 
 def cmd_resolve(args):
-    """Resolve dependencies without installing."""
+    """Resolve dependencies and print the result; install only with --install."""
     setup_logging(args.verbose)
 
-    dm = DependencyManager(
-        cache_dir=args.cache_dir,
-        install_timeout=args.timeout,
-        max_retries=args.max_retries
-    )
+    dm = _make_manager(args)
 
     if args.requirements:
-        requirements = {args.requirements: Path(args.requirements).read_text()}
+        requirements = {Path(args.requirements).stem: Path(args.requirements).read_text()}
     else:
         requirements = None
 
+    install = getattr(args, 'install', False)
     print("Resolving dependencies...")
-    asyncio.run(dm.resolve_dependencies(
+    pins = dm.resolve_dependencies_sync(
         modules_requirements=requirements,
         requirements_file_pattern=args.pattern,
-        search_dirs=args.search_dirs
-    ))
+        search_dirs=args.search_dirs,
+        install=False
+    )
 
-    print("✅ Dependencies resolved")
+    installed = get_installed_versions()
+    missing, wrong_version, _ = dm.packages_needing_install(pins, installed)
+    for package_name, version_spec in sorted(pins.items(), key=lambda item: item[0].lower()):
+        print(f"   {package_name}{version_spec}")
+    if not install:
+        print(f"✅ Dependencies resolved: {len(pins)} packages "
+              f"({len(missing)} would be installed, {len(wrong_version)} would change version)")
+        return
+
+    print(f"Installing: {len(missing)} missing, {len(wrong_version)} version changes...")
+    dm._install(pins, no_deps=bool(dm.last_conflicts))
+    print(f"✅ Dependencies resolved and installed: {len(pins)} packages "
+          f"({len(missing)} installed, {len(wrong_version)} changed version)")
 
 
 def cmd_cache(args):
@@ -78,7 +103,15 @@ def cmd_cache(args):
 
     dm = DependencyManager(cache_dir=args.cache_dir)
 
-    if args.clear:
+    if getattr(args, 'remove', False):
+        if not args.module:
+            print("❌ --remove requires --module <name>")
+            return
+        if dm.remove_module(args.module):
+            print(f"✅ Removed module: {args.module} (its pins are dropped on the next install)")
+        else:
+            print(f"ℹ️  Module not in cache: {args.module}")
+    elif args.clear:
         if args.module:
             dm.invalidate_module_cache(args.module)
             print(f"✅ Cleared cache for module: {args.module}")
@@ -91,7 +124,16 @@ def cmd_cache(args):
         print(f"Combined hash: {cache.get('combined_hash', 'None')}")
         print(f"Last updated: {cache.get('last_updated', 'Never')}")
         print(f"Resolved packages: {len(cache.get('resolved_packages', {}))}")
-        print(f"Module caches: {len(cache.get('requirements_caches', {}))}")
+        module_caches = cache.get('requirements_caches', {})
+        print(f"Module caches: {len(module_caches)}")
+        for module_name, module_cache in sorted(module_caches.items()):
+            skipped = module_cache.get('skipped_packages') or []
+            note = f" (skipped due to major-version conflict: {', '.join(skipped)})" if skipped else ""
+            print(f"   • {module_name}: {len(module_cache.get('packages', {}))} packages{note}")
+        conflicts = cache.get('conflicts') or []
+        print(f"Conflicts handled: {len(conflicts)}")
+        for conflict in conflicts:
+            print(f"   • {format_conflict(conflict)}")
 
 
 def cmd_check(args):
@@ -106,8 +148,8 @@ def cmd_check(args):
         print("❌ No cached packages found. Run 'cdm install' first.")
         return
 
-    from .utils import get_installed_packages, canonicalize_name
-    installed_packages = get_installed_packages()
+    from . import utils
+    installed_packages = utils.get_installed_versions()
 
     print(f"Checking {len(resolved_packages)} cached packages against {len(installed_packages)} installed packages...")
 
@@ -116,28 +158,30 @@ def cmd_check(args):
     version_mismatches = []
 
     for package_name, version_spec in resolved_packages.items():
-        base_name = package_name.split('[')[0] if '[' in package_name else package_name
-        canonical_name = canonicalize_name(base_name)
+        canonical_name = canonicalize_name(base_package_name(package_name))
 
         if canonical_name not in installed_packages:
             missing_packages.append(f"{package_name}{version_spec}")
-        else:
-            # Check version if we have exact version info
-            if version_spec.startswith('=='):
-                expected_version = version_spec[2:]  # Remove '=='
-                # We would need to get the actual installed version to compare
-                # For now, just check presence
-                pass
+        elif not version_satisfies(installed_packages[canonical_name], version_spec):
+            version_mismatches.append(
+                f"{package_name}: expected {version_spec.lstrip('=')}, installed {installed_packages[canonical_name]}"
+            )
 
-    cached_canonical_names = set()
-    for package_name in resolved_packages.keys():
-        base_name = package_name.split('[')[0] if '[' in package_name else package_name
-        cached_canonical_names.add(canonicalize_name(base_name))
+    cached_canonical_names = {
+        canonicalize_name(base_package_name(package_name)) for package_name in resolved_packages
+    }
 
     for installed_name in installed_packages:
         if installed_name not in cached_canonical_names:
             if args.all:
                 extra_packages.append(installed_name)
+
+    conflicts = cache.get('conflicts') or []
+    major_conflicts = [c for c in conflicts if c.get('kind') == 'major']
+    if major_conflicts:
+        print(f"⚠️  {len(major_conflicts)} major-version conflicts (some module requirements were skipped):")
+        for conflict in major_conflicts:
+            print(f"   • {format_conflict(conflict)}")
 
     if not missing_packages and not version_mismatches:
         print("✅ All cached packages are properly installed")
@@ -190,14 +234,13 @@ def cmd_outdated(args):
         outdated_data = json.loads(result.stdout)
 
         # Filter to only packages in our cache
-        cached_package_names = set()
-        for package_name in resolved_packages.keys():
-            base_name = package_name.split('[')[0] if '[' in package_name else package_name
-            cached_package_names.add(base_name.lower())
+        cached_package_names = {
+            canonicalize_name(base_package_name(package_name)) for package_name in resolved_packages
+        }
 
         outdated_cached_packages = []
         for package_info in outdated_data:
-            package_name = package_info['name'].lower()
+            package_name = canonicalize_name(package_info['name'])
             if package_name in cached_package_names:
                 current_version = package_info['version']
                 latest_version = package_info['latest_version']
@@ -222,23 +265,19 @@ def cmd_upgrade(args):
     """Upgrade packages to their latest versions."""
     setup_logging(args.verbose)
 
-    dm = DependencyManager(
-        cache_dir=args.cache_dir,
-        install_timeout=args.timeout,
-        max_retries=args.max_retries
-    )
+    dm = _make_manager(args)
 
     if args.requirements:
         print(f"Upgrading from {args.requirements}...")
-        requirements = {args.requirements: Path(args.requirements).read_text()}
-        asyncio.run(dm.upgrade_dependencies(requirements))
+        requirements = {Path(args.requirements).stem: Path(args.requirements).read_text()}
+        dm.upgrade_dependencies_sync(requirements)
     elif args.packages:
         print(f"Upgrading packages: {', '.join(args.packages)}...")
         requirements = {"cli": "\n".join(args.packages)}
-        asyncio.run(dm.upgrade_dependencies(requirements))
+        dm.upgrade_dependencies_sync(requirements)
     else:
         print("Auto-discovering and upgrading requirements...")
-        asyncio.run(dm.upgrade_dependencies())
+        dm.upgrade_dependencies_sync()
 
     print("✅ Upgrade completed")
 
@@ -283,8 +322,23 @@ def create_parser():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=60,
-        help="Timeout in seconds for each pip install attempt (default: 60)"
+        default=300,
+        help="Timeout in seconds for each pip install attempt, 0 disables (default: 300)"
+    )
+
+    parser.add_argument(
+        "--resolve-timeout",
+        type=int,
+        default=600,
+        metavar="SECONDS",
+        help="Timeout in seconds for dependency resolution (pip-compile), 0 disables (default: 600)"
+    )
+
+    parser.add_argument(
+        "-c", "--constraint",
+        action="append",
+        metavar="FILE",
+        help="Constraints file applied to every resolution, e.g. core/pinned packages (repeatable)"
     )
 
     parser.add_argument(
@@ -293,6 +347,14 @@ def create_parser():
         default=5,
         metavar="N",
         help="Maximum retry attempts for failed package installs (default: 5)"
+    )
+
+    parser.add_argument(
+        "--on-conflict",
+        choices=["resolve", "fail"],
+        default="resolve",
+        help="When modules conflict: 'resolve' uses the latest version within the same major and "
+             "skips+flags different majors; 'fail' stops with a report (default: resolve)"
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -309,6 +371,16 @@ def create_parser():
     install_parser.add_argument(
         "-r", "--requirements",
         help="Install from requirements file"
+    )
+    install_parser.add_argument(
+        "-p", "--pattern",
+        default="requirements.txt",
+        help="File pattern to auto-discover (default: requirements.txt)"
+    )
+    install_parser.add_argument(
+        "--search-dirs",
+        nargs="*",
+        help="Directories to auto-discover requirements files in (default: current dir)"
     )
     install_parser.set_defaults(func=cmd_install)
 
@@ -329,7 +401,12 @@ def create_parser():
 
     resolve_parser = subparsers.add_parser(
         "resolve",
-        help="Resolve dependencies without installing"
+        help="Resolve dependencies and show the result (installs only with --install)"
+    )
+    resolve_parser.add_argument(
+        "--install",
+        action="store_true",
+        help="Also install missing/outdated packages (what 'cdm resolve' did in 1.3.0)"
     )
     resolve_parser.add_argument(
         "-r", "--requirements",
@@ -358,7 +435,12 @@ def create_parser():
     )
     cache_parser.add_argument(
         "--module",
-        help="Clear cache for specific module (use with --clear)"
+        help="Module name for --clear (force re-resolve) or --remove (unregister)"
+    )
+    cache_parser.add_argument(
+        "--remove",
+        action="store_true",
+        help="Unregister --module; its pins are dropped on the next install (nothing is uninstalled)"
     )
     cache_parser.add_argument(
         "--info",
