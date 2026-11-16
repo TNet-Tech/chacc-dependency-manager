@@ -1,14 +1,12 @@
-***
-
 # ChaCC Dependency Manager (Pip Accelerator)
 
 **Smart dependency resolution with intelligent caching.** ChaCC Dependency Manager (Cache-Checked) is a dependency manager for Python that is up to 20x faster than pip for repeated installations. It's designed to accelerate your development workflows, especially in environments like Docker and CI/CD pipelines.
 
 ## Our Users
-Our users includes but not limited to: 
+Our users include, but are not limited to:
 - [ChaCC API](https://pypi.org/project/chacc-api/)
 
-Want to be part of this history making list. Kindly, start to use it now
+Want to join this list? Start using it today.
 
 ## When to Use ChaCC Dependency Manager
 
@@ -32,18 +30,16 @@ Ready to give ChaCC Dependency Manager a try? Here's how to get up and running i
 
 ### Installation
 
-You can install ChaCC Dependency Manager using pip. For most users, installing it with the `[resolver]` extra is recommended as it includes the command-line interface (CLI).
+You can install ChaCC Dependency Manager using pip. It needs Python 3.9 or newer, and the plain install includes everything: the Python library, the `cdm` command and pip-tools.
 
 ```bash
-# Recommended installation with CLI commands
-pip install chacc-dependency-manager[resolver]
-
-# Basic installation (library only)
 pip install chacc-dependency-manager
 
-# Full development setup
-pip install chacc-dependency-manager[full]
+# Development setup (tests, linters, build tools)
+pip install "chacc-dependency-manager[dev]"
 ```
+
+The `[resolver]` extra from earlier versions still works, but it adds nothing anymore.
 
 ### 🏃‍♀️ Quick Usage
 
@@ -150,7 +146,7 @@ cdm resolve --install
 
 #### **Checking Package Installation Status**
 
-Verify that cached packages are installed at the resolved versions. Missing packages, version mismatches and [major-version conflicts](#handling-conflicts-between-modules) are all reported.
+Verify that cached packages are installed at the resolved versions. Missing packages, version mismatches and [major-version conflicts](#handling-version-conflicts-between-requirements-files) are all reported.
 
 ```bash
 # Check if all cached packages are properly installed
@@ -236,7 +232,7 @@ ChaCC Dependency Manager's primary advantage is its intelligent caching. On the 
 *   **Smart Caching**: Only re-installs dependencies that have changed.
 *   **Incremental Updates**: Avoids full reinstalls, saving significant time.
 *   **Multi-File Support**: Handles complex projects with multiple `requirements.txt` files.
-*   **Conflict Handling**: Modules share one set of versions. Same-major conflicts use the latest version, and different-major conflicts are skipped and flagged without blocking the module.
+*   **Conflict Handling**: All requirements files share one set of versions. When two files clash on the same major version the latest is used; a clash across major versions is skipped and flagged, and the rest of that file is still installed.
 *   **Docker-Optimized**: Works seamlessly with Docker's layer caching for faster image builds.
 *   **Package Validation**: Verifies that cached packages are still installed correctly.
 *   **Debug Logging**: Provides detailed output to help you understand caching behavior.
@@ -253,7 +249,7 @@ Here is a simple, cache-friendly Dockerfile that leverages ChaCC Dependency Mana
 FROM python:3.11-slim
 
 # Install the dependency manager
-RUN pip install chacc-dependency-manager[resolver]
+RUN pip install chacc-dependency-manager
 
 # Copy your requirements files
 COPY requirements*.txt ./
@@ -275,7 +271,7 @@ You can use caching in your CI/CD pipelines to persist the ChaCC Dependency Mana
 
 ```yaml
 - name: Cache dependencies
-  uses: actions/cache@v3
+  uses: actions/cache@v4
   with:
     path: .dependency_cache
     key: deps-${{ hashFiles('requirements*.txt', 'pyproject.toml') }}
@@ -288,20 +284,20 @@ You can use caching in your CI/CD pipelines to persist the ChaCC Dependency Mana
 
 ### Auto-Discovery of Requirements
 
- Dependency Manager can automatically discover requirement files based on common patterns.
+ChaCC Dependency Manager can automatically discover requirement files based on common patterns.
 
 **Supported Patterns:**
 *   `"requirements.txt"` (default)
 *   `"*.txt"`
 *   `"requirements-*.txt"`
 
-ChaCC Dependency Manager will search for these files in the current directory, or in the directories given by `search_dirs` (`cdm resolve --search-dirs ...`). Each file becomes a module named after the file without its extension (`requirements-api`). Paths inside a file (`-r base.txt`, `-c constraints.txt`, `-e ./libs/core`, `./libs/plugin`) are relative to that file, as pip reads them; in requirements text passed from Python they are relative to the current folder. Editing an included file (`-r` / `-c`) re-resolves the modules that include it. When several discovered files share a name, such as a `requirements.txt` in each service folder, each one is named after its path instead (`services/api/requirements`), so none of them is dropped. The discovered files are the complete set: if a file disappears, its pins are dropped on the next run. Modules added explicitly (in code, with `-r`, or as command-line packages) are kept. If no file is found at all (for example when run from the wrong folder), nothing is dropped and the registered modules are used.
+ChaCC Dependency Manager will search for these files in the current directory, or in the directories given by `search_dirs` (`cdm install --search-dirs ...`). Each file becomes a module named after the file without its extension (`requirements-api`). Paths inside a file (`-r base.txt`, `-c constraints.txt`, `-e ./libs/core`, `./libs/plugin`) are relative to that file, as pip reads them; in requirements text passed from Python they are relative to the current folder. Editing an included file (`-r` / `-c`) re-resolves the modules that include it. When several discovered files share a name, such as a `requirements.txt` in each service folder, each one is named after its path instead (`services/api/requirements`), so none of them is dropped. The discovered files are the complete set: if a file disappears, its pins are dropped on the next run. Modules added explicitly (in code, with `-r`, or as command-line packages) are kept. If no file is found at all (for example when run from the wrong folder), nothing is dropped and the registered modules are used.
 
 ### Protecting Core Packages with Constraints
 
-Each resolve checks every registered requirements file or module jointly, whether they were passed in the same call or in earlier ones, so they share a single, consistent set of versions. See [Handling Conflicts Between Modules](#handling-conflicts-between-modules) for what happens when they can't agree.
+Each resolve checks every registered requirements file (or set of requirements passed from Python) together, whether they came in the same run or in earlier ones, so they share a single, consistent set of versions. See [Handling Version Conflicts Between Requirements Files](#handling-version-conflicts-between-requirements-files) for what happens when they can't agree.
 
-To stop modules from changing the versions your application depends on, pass those pins as **constraints** (pip `-c` format). A module can add packages, but it can't move a constrained version:
+To stop your other requirements files from changing the versions your application depends on, pass those pins as **constraints** (pip `-c` format). A requirements file can add packages, but it can't move a constrained version:
 
 ```bash
 # core-constraints.txt contains lines like: fastapi==0.115.0
@@ -316,32 +312,36 @@ config = Config(constraint_files=["core-constraints.txt"])
 
 Editing a constraints file triggers a new resolve on the next run. Constraints always win a conflict, even within the same major version.
 
-### Handling Conflicts Between Modules
+### Handling Version Conflicts Between Requirements Files
 
-If modules can't all be satisfied together, ChaCC resolves each one on its own and settles each package that differs:
+ChaCC manages each requirements file (or each set of requirements passed from Python) as a separate **module**, named after the file. If they can't all be satisfied together, ChaCC resolves each one on its own and settles each package they disagree on, instead of failing:
 
 | Situation | Example | Result |
 | :--- | :--- | :--- |
-| Same major version | auth wants `urllib3 1.26.9`, payments wants `1.26.20` | Everyone gets the **latest**, `1.26.20` |
-| Different major version | auth wants `urllib3 1.26.20`, payments wants `2.8.0` | The existing module's `1.26.20` is kept. payments' requirement is **skipped and flagged**, and payments still loads. |
-| Core constraint involved | core pins `urllib3==1.26.5` | The core version always wins |
+| Same major version | `requirements.txt` wants `urllib3 1.26.9`, `requirements-dev.txt` wants `1.26.20` | Both get the **latest**, `1.26.20` |
+| Different major version | `requirements.txt` wants `urllib3 1.26.20`, `legacy.txt` wants `2.8.0` | The version from the file added first, `1.26.20`, is kept. `legacy.txt`'s requirement for urllib3 is **skipped and flagged**; the rest of `legacy.txt` is still installed. |
+| Constraint involved | `core-constraints.txt` pins `urllib3==1.26.5` | The constrained version always wins |
 
-For `0.x` packages the minor version counts as the major (`0.9` → `0.10` is a major change), following semver. "Existing" means the module registered first. Every adjustment is logged:
+For `0.x` packages the minor version counts as the major (`0.9` → `0.10` is a major change), following semver. Every adjustment is logged with the files and versions on each side:
 
 ```
-WARNING: ⚠️  Dependency conflict on 'urllib3': auth wants 1.26.20, payments wants 2.8.0. Major versions differ,
-so 1.26.20 (from auth) is kept and the requirement from payments is skipped. payments may not work correctly
+WARNING: ⚠️  Dependency conflict on 'urllib3': requirements wants 1.26.20, legacy wants 2.8.0. Major versions differ,
+so 1.26.20 (from requirements) is kept and the requirement from legacy is skipped. legacy may not work correctly
 ```
+
+A single file that contradicts itself, for example `idna==3.7` in a file it includes with `-r` and `idna==3.8` in the file itself, can't be settled and fails with pip's error.
 
 Conflicts are saved in the cache and shown by `cdm check` and `cdm cache --info`, which also lists each module's skipped packages. Major-version conflicts are warned about again on every run until the requirements change. In code they're available as `dm.last_conflicts`, a list of dicts with `package`, `chosen`, `chosen_from`, `requested` (module → version), `kind` (`"minor"` or `"major"`) and `skipped_modules`.
 
 After a merge, packages are installed exactly as pinned (`pip install --no-deps`), because the merged versions deliberately break some declared requirements. Any requirements left unmet (from `pip check`) are logged as warnings. Only new or changed modules are resolved again when a conflict happens; unchanged ones reuse their cached package set.
 
-To stop on conflicts instead, use `on_conflict="fail"` / `--on-conflict fail`. ChaCC then raises `ResolutionError` naming each package, module and version, and leaves the cache untouched. The error's `.conflicts` holds the same dicts as `last_conflicts`. A module that can't resolve even on its own (for example a misspelled package) always raises `ResolutionError`, with `.module` set to that module.
+To stop on conflicts instead, use `--on-conflict fail` / `on_conflict="fail"`. ChaCC then raises `ResolutionError` naming each package, file and version, and leaves the cache untouched. The error's `.conflicts` holds the same dicts as `last_conflicts`. A file that can't resolve even on its own (for example a misspelled package) always raises `ResolutionError`, with `.module` set to its module name.
 
-### Using ChaCC from an Async Server
+### Using ChaCC from Async Code
 
 `resolve_dependencies()`, `upgrade_dependencies()` and `re_resolve_dependencies()` run pip in a worker thread, so awaiting them doesn't block the event loop. Calls that use the same cache directory run one at a time: across separate `DependencyManager` or `Config` instances in one process, and across processes too (for example several server workers or parallel CI jobs), using a lock file (`.lock`) in the cache directory. A process that has to wait logs "Waiting for another process using the cache". On a file system without file locking (some network mounts), ChaCC logs a warning and only coordinates within the process. In scripts, use the blocking `resolve_dependencies_sync()` / `upgrade_dependencies_sync()` instead of `asyncio.run(...)`.
+
+For example, an application that installs the dependencies of plugins added at runtime:
 
 ```python
 from chacc import DependencyManager, ResolutionError
@@ -474,8 +474,8 @@ This release fixes how packages are resolved, cached and installed. See [CHANGEL
 
 - **Failed resolutions are no longer cached.** A failure raises `ResolutionError` and leaves the cache untouched, so the next run tries again.
 - **Version-aware installs.** Packages installed at a different version from the resolved pin are reinstalled, so upgrades are applied. `cdm check` reports version mismatches.
-- **One combined resolve, with a conflict policy.** All modules are resolved together. When they can't agree: same major version → the latest is used; different major → the existing version is kept and the newcomer's requirement is skipped and flagged, without blocking the module. Use `-c/--constraint` to protect core packages.
-- **Modules can arrive one at a time.** Explicit modules add to the set. `remove_module()` / `cdm cache --remove --module` unregisters one.
+- **Requirements files are checked against each other, with a conflict policy.** Every file shares one set of versions. When two files clash: same major version → the latest is used; different major → the version from the file added first is kept, and the other file's requirement is skipped and flagged while the rest of it is still installed. Use `-c/--constraint` to protect core packages.
+- **Files and modules can arrive one at a time.** Each `cdm install -r FILE` or explicit module adds to the set. `remove_module()` / `cdm cache --remove --module` unregisters one.
 - **Upgrades apply.** `cdm upgrade` upgrades every registered module. `cdm upgrade PKG` / `-r FILE` upgrades only those packages and leaves other modules' pins alone.
 - **Compatible with 1.3.0.** Existing CLI commands and Python calls keep working. The main difference: a resolution failure now raises `ResolutionError` (and `cdm` exits with status 1) instead of being cached as an empty result.
 - **No stale pins.** Removing a module or a discovered requirements file drops its pins from the cache.
