@@ -143,6 +143,12 @@ with the same order, and no new parameter is required. The behavior changes to p
   matching what it has always received (the set of installed package names)
 - pip install output is no longer written to the debug log (only pip's "Successfully installed" line)
 - `merge_resolved_packages()` is kept for backward compatibility but the resolver no longer uses it
+- The code is split into smaller modules, each with one job. `chacc.manager` keeps `DependencyManager`
+  and the public API; the work is done by `registry` (module set and hashes), `resolver` and `pip_compile`
+  (resolution and the conflict policy), `installer` and `pip_leftovers` (pip installs), `cache` (the cache
+  file), `locking` and `errors`. The helpers in `chacc.utils` are grouped into `names`, `versions` and
+  `requirements`, and the CLI commands moved to `chacc.commands`. Everything that could be imported
+  before (from `chacc`, `chacc.manager`, `chacc.utils` and `chacc.cli`) still can.
 
 ### Removed
 
@@ -176,6 +182,8 @@ with the same order, and no new parameter is required. The behavior changes to p
   the requirements file (or the current folder for text passed from Python), as pip does.
 - Editing a file included with `-r` / `-c` didn't trigger a new resolve. Included files now count toward
   the module's hash.
+- Packages that come from a file included with `-r` are credited to the module that includes it (they
+  were missing from that module's package list, which the conflict fallback reuses)
 - Under the CLI, every log line was printed twice, and debug messages showed without `-v`
 - `cdm demo modules` / `cdm demo cache` described the 1.2 behavior and left a `./demo_cache` folder behind.
   They now show modules registered one at a time, the conflict policy and the 1.4 cache layout, using a
