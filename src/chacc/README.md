@@ -35,7 +35,7 @@ from chacc import DependencyManager, ResolutionError
 
 dm = DependencyManager(cache_dir=".dependency_cache", constraint_files=["core-constraints.txt"])
 
-# Modules can be registered one per call (e.g. when a plugin is uploaded)...
+# Each set of requirements is a module. Modules can be added one per call...
 await dm.resolve_dependencies({"payments": "stripe>=10\nrequests"})
 
 # ...or all at once. Either way, each call checks the passed modules against
@@ -48,13 +48,15 @@ print(dm.last_conflicts)              # conflicts handled in the last run
 
 The async methods run pip in a worker thread, so they don't block an event loop. Work on one cache directory is serialised across threads and processes.
 
-## When modules conflict
+## When requirements files conflict
 
-- **Same major version**: the latest requested version is used by every module.
-- **Different major version**: the module registered first keeps its version. The newcomer's requirement for that package is skipped and flagged, and the module still loads.
-- **Core constraints** (`constraint_files` / `-c`) always win.
+Each requirements file (or set of requirements passed from Python) is managed as a module. When two of them ask for versions that can't be satisfied together:
 
-Conflicts are logged with the modules and versions involved, and shown by `cdm check` and `cdm cache --info`. Use `on_conflict="fail"` to raise `ResolutionError` instead.
+- **Same major version**: the latest requested version is installed for both.
+- **Different major version**: the version from the file added first is kept. The other file's requirement for that package is skipped and flagged; the rest of that file is still installed.
+- **Constraints** (`constraint_files` / `-c`) always win.
+
+Conflicts are logged with the files and versions involved, and shown by `cdm check` and `cdm cache --info`. Use `on_conflict="fail"` to raise `ResolutionError` instead.
 
 ## License
 

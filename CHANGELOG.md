@@ -69,7 +69,7 @@ with the same order, and no new parameter is required. The behavior changes to p
   at the wrong version
 - `chacc.utils.get_installed_versions()`, which returns `{canonical_name: version}`
 - The install target (site-packages path, interpreter, virtualenv or not) is logged before pip runs
-- Regression tests for every fix and for the conflict policy (`tests/test_package_fixes.py`)
+- Regression tests for every fix and for the conflict policy (`tests/test_*.py`, grouped by topic)
 
 ### Changed
 
