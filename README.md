@@ -484,6 +484,8 @@ This release fixes how packages are resolved, cached and installed. See [CHANGEL
 - **Includes work.** `-r`, `-c`, `-e` and local paths inside requirements files resolve relative to the file, and editing an included file triggers a new resolve.
 - **Timeouts.** pip-compile has a timeout (`--resolve-timeout`, default 600s). The pip install timeout default is back to 300s per attempt.
 - **Install location is logged.** A fallback to a user install is reported as a warning.
+- **No pip leftovers.** If an install is interrupted while pip is replacing a package, ChaCC removes the `~package` folders pip leaves behind and reinstalls cleanly, so pip stops warning "Ignoring incompletely removed distribution".
+- **Python 3.9+.** Python 3.8 is no longer supported; on 3.8, pip keeps installing 1.3.0.
 - **Stable cache.** The environment hash no longer includes the host kernel version, so host updates don't clear the cache. A Python upgrade re-resolves every module without forgetting the ones registered one call at a time.
 - **Clear errors when offline.** If the package index can't be reached, the error says so, instead of being reported as a conflict between modules.
 - **`cdm resolve` is a dry run.** It prints what would be installed and changes nothing. `cdm resolve --install` also installs (the 1.3.0 behavior), and `cdm install` / `cdm upgrade` now accept `-p/--pattern` and `--search-dirs`.

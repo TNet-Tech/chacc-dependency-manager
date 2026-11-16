@@ -903,3 +903,67 @@ def test_log_level_option(cache_dir):
 
     with pytest.raises(ValueError, match="Unknown log_level"):
         make_dm(cache_dir, log_level='loud')
+
+
+# --- pip leftovers ("Ignoring incompletely removed distribution ~...") -------------------
+
+@pytest.fixture
+def fake_site(tmp_path):
+    site_dir = tmp_path / 'site-packages'
+    site_dir.mkdir()
+    with patch.object(manager_module.sysconfig, 'get_paths',
+                      return_value={'purelib': str(site_dir), 'platlib': str(site_dir)}), \
+         patch.object(manager_module.site, 'getusersitepackages', return_value=str(tmp_path / 'none')):
+        manager_module._REPORTED_LEFTOVERS.clear()
+        yield site_dir
+
+
+def test_leftovers_of_a_killed_pip_are_removed_and_the_retry_reinstalls(cache_dir, fake_site):
+    calls = []
+
+    def pip(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 1:
+            # pip got as far as moving the old version aside, then was killed.
+            (fake_site / '~qlalchemy').mkdir()
+            (fake_site / '~qlalchemy-2.0.53.dist-info').mkdir()
+            raise subprocess.TimeoutExpired(cmd, 300)
+        result = MagicMock()
+        result.returncode, result.stdout, result.stderr = 0, "", ""
+        return result
+
+    dm = DependencyManager(cache_dir=cache_dir, max_retries=2)
+    with patch.object(manager_module.subprocess, 'run', pip), patch.object(manager_module.time, 'sleep'):
+        dm._run_pip_install(['sqlalchemy==2.1.8'])
+
+    assert list(fake_site.iterdir()) == []
+    assert '--force-reinstall' not in calls[0]
+    assert '--force-reinstall' in calls[1] and '--no-deps' in calls[1]
+
+
+def test_existing_leftovers_are_reported_once_and_left_alone(cache_dir, fake_site):
+    (fake_site / '~ld-package').mkdir()
+    logger = MagicMock()
+    dm = make_dm(cache_dir, logger=logger)
+    with patch.object(manager_module.subprocess, 'run', FakeRunner()):
+        dm._run_pip_install(['requests==2.31.0'])
+        dm._run_pip_install(['idna==3.6'])
+    assert (fake_site / '~ld-package').exists()
+    warnings = [c.args[0] for c in logger.warning.call_args_list if 'incompletely removed' in c.args[0]]
+    assert len(warnings) == 1 and '~ld-package' in warnings[0]
+
+
+def test_failed_attempt_without_leftovers_retries_normally(cache_dir, fake_site):
+    runner = FakeRunner()
+    calls = []
+
+    def pip(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd, 300)
+        return runner(cmd, **kwargs)
+
+    dm = DependencyManager(cache_dir=cache_dir, max_retries=2)
+    with patch.object(manager_module.subprocess, 'run', pip), patch.object(manager_module.time, 'sleep'):
+        dm._run_pip_install(['requests==2.31.0'])
+    assert '--force-reinstall' not in calls[1]

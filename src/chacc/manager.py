@@ -49,9 +49,7 @@ class ResolutionError(RuntimeError):
 
     def __init__(self, message: str, conflicts: Optional[List[Dict]] = None, module: Optional[str] = None):
         super().__init__(message)
-        #: Conflicts found between modules (see :func:`chacc.utils.merge_with_version_policy`)
         self.conflicts = conflicts or []
-        #: Module that failed to resolve on its own, if any
         self.module = module
 
 
@@ -65,7 +63,6 @@ def _not_a_conflict(message: str) -> ResolutionError:
     return error
 
 
-# pip messages that mean the package index couldn't be reached, not that versions clash.
 _NETWORK_ERROR_MARKERS = (
     "NewConnectionError", "ConnectTimeoutError", "ReadTimeoutError", "ProxyError", "SSLError",
     "Max retries exceeded", "Temporary failure in name resolution", "Name or service not known",
@@ -77,14 +74,13 @@ ON_CONFLICT_FAIL = "fail"
 
 _CONSTRAINTS_KEY = "__constraints__"
 
-#: Name used for the core constraint files in conflict reports
 CORE_CONSTRAINTS = "core constraints"
 
-try:  # POSIX
+try:
     import fcntl as _fcntl
-except ImportError:  # pragma: no cover - Windows
+except ImportError:
     _fcntl = None
-try:  # Windows
+try:
     import msvcrt as _msvcrt
 except ImportError:
     _msvcrt = None
@@ -178,7 +174,8 @@ class _CacheLock:
         return True
 
 
-# One lock per cache directory, shared by every DependencyManager pointing at it.
+_REPORTED_LEFTOVERS: Set[str] = set()
+
 _CACHE_LOCKS: Dict[str, _CacheLock] = {}
 _CACHE_LOCKS_GUARD = threading.Lock()
 
@@ -204,10 +201,8 @@ def _summarize_pip_error(output: str, max_lines: int = 25) -> str:
         if in_traceback:
             if line[:1].isspace():
                 continue
-            in_traceback = False  # first unindented line is the exception message
+            in_traceback = False
         if _PYTHON_EXCEPTION_LINE.match(line):
-            # e.g. "pip._internal.exceptions.DistributionNotFound: ...": repeats pip's own
-            # ERROR line in Python terms.
             continue
         if line.startswith(("During handling of the above exception", "The above exception was")):
             continue
@@ -478,8 +473,6 @@ class DependencyManager:
         """
         registered = {n: e for n, e in req_caches.items() if 'requirements' in e}
         if modules_requirements:
-            # Relative paths in passed-in text (-r/-c/-e/./local) are relative to the
-            # current folder; they're made absolute because pip-compile runs elsewhere.
             incoming = [(n, absolutize_requirement_paths(c, os.getcwd())) for n, c in modules_requirements.items()]
             source = 'explicit'
             keep = {} if replace else {n: e for n, e in registered.items() if n not in modules_requirements}
@@ -513,8 +506,6 @@ class DependencyManager:
 
     @staticmethod
     def _module_hash(name: str, content: str) -> str:
-        # Files included with -r/-c count as part of the module: editing a shared
-        # base.txt must re-resolve every module that includes it.
         files = included_files(content)
         if files:
             content = f"{content}\n#included:{calculate_files_hash(files)}"
@@ -889,15 +880,78 @@ class DependencyManager:
                 "processes/services. Use a virtualenv or a writable environment to avoid this."
             )
 
+    @staticmethod
+    def _pip_leftovers() -> Set[str]:
+        """
+        ``~``-prefixed folders in site-packages.
+
+        pip moves a package it is replacing to ``~ackage`` and deletes it once the new
+        version is in place. If pip is stopped in between (e.g. by the install timeout),
+        the folder stays behind and every later pip run warns "Ignoring incompletely
+        removed distribution ~...".
+        """
+        paths = sysconfig.get_paths()
+        dirs = {paths.get('purelib'), paths.get('platlib')}
+        try:
+            dirs.add(site.getusersitepackages())
+        except Exception:
+            pass
+        found: Set[str] = set()
+        for directory in dirs:
+            if not directory or not os.path.isdir(directory):
+                continue
+            try:
+                found.update(os.path.join(directory, n) for n in os.listdir(directory) if n.startswith('~'))
+            except OSError:
+                continue
+        return found
+
+    def _remove_pip_leftovers(self, before: Set[str]) -> bool:
+        """
+        Remove leftovers that appeared during our own pip run (never ones that were
+        already there). Returns True if anything was found.
+        """
+        created = sorted(self._pip_leftovers() - before)
+        for path in created:
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                self.logger.info(f"Removed leftover of the interrupted pip run: {path}")
+            except OSError as e:
+                self.logger.warning(f"Could not remove pip leftover {path}: {e}")
+        return bool(created)
+
+    def _warn_about_existing_leftovers(self, leftovers: Set[str]):
+        new = leftovers - _REPORTED_LEFTOVERS
+        if not new:
+            return
+        _REPORTED_LEFTOVERS.update(new)
+        self.logger.warning(
+            "Found leftovers of an earlier interrupted pip install, which make pip warn "
+            "'Ignoring incompletely removed distribution'. ChaCC didn't create them, so it "
+            "leaves them alone; they are safe to delete once the package works: "
+            + ", ".join(sorted(new))
+        )
+
     def _run_pip_install(self, batch: List[str], no_deps: bool = False):
         last_error = None
         base_cmd = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check']
         if no_deps:
             base_cmd.append('--no-deps')
+        existing = self._pip_leftovers()
+        self._warn_about_existing_leftovers(existing)
+        reinstall = False
         for attempt in range(1, self.max_retries + 1):
+            cmd = base_cmd + batch
+            if reinstall:
+                # A package may have been half-replaced: put every file back. The batch
+                # holds all pins that needed installing, so dependencies are covered.
+                cmd = base_cmd + ['--force-reinstall'] + ([] if no_deps else ['--no-deps']) + batch
             try:
                 result = subprocess.run(
-                    base_cmd + batch, capture_output=True, text=True, timeout=self.install_timeout
+                    cmd, capture_output=True, text=True, timeout=self.install_timeout
                 )
                 output = f"{result.stdout or ''}\n{result.stderr or ''}"
                 for line in (result.stdout or '').splitlines():
@@ -918,11 +972,13 @@ class DependencyManager:
                 self.logger.warning(
                     f"pip install attempt {attempt}/{self.max_retries} timed out for {len(batch)} packages"
                 )
+                reinstall = self._remove_pip_leftovers(existing) or reinstall
             except subprocess.CalledProcessError as e:
                 last_error = e.stderr or "unknown error"
                 self.logger.warning(
                     f"pip install attempt {attempt}/{self.max_retries} failed for {len(batch)} packages"
                 )
+                reinstall = self._remove_pip_leftovers(existing) or reinstall
 
             if attempt < self.max_retries:
                 backoff = min(2 ** (attempt - 1), 30)
@@ -950,7 +1006,6 @@ class DependencyManager:
         """
         if self.install_hook:
             try:
-                # Hooks receive a set of canonical names, as in earlier versions.
                 success = self.install_hook(resolved_packages, set(installed_packages))
                 if success:
                     self.logger.info("Custom installation hook completed successfully")
@@ -1003,8 +1058,7 @@ class DependencyManager:
             if words and canonicalize_name(words[0]) in ours:
                 self.logger.warning(f"Unmet requirement after conflict resolution: {line.strip()}")
 
-    # --------------------------------------------------------- orchestration
-
+    
     def _build_cache(
         self,
         requirements: List[Tuple[str, str]],
@@ -1200,10 +1254,7 @@ class DependencyManager:
                     return {}
 
                 module_hashes, combined_hash = self._requirement_hashes(requirements)
-                # The existing cache is only replaced once the upgrade resolves successfully.
                 if modules_requirements:
-                    # Selective upgrade (as in earlier versions): only the given modules'
-                    # packages move; every other module keeps its pins.
                     targets = []
                     for name, content in modules_requirements.items():
                         targets.extend(requirement_names(content))

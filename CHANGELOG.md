@@ -17,6 +17,8 @@ with the same order, and no new parameter is required. The behavior changes to p
   and `cdm install` exits with status 1, instead of carrying on with nothing cached for that module
 - `cdm resolve` no longer installs, matching its help text. Use `cdm resolve --install` for the old behavior.
 - the default pip install timeout is 300s instead of 60s
+- Python 3.8 is no longer supported (end of life since October 2024). pip on Python 3.8 keeps installing
+  1.3.0 automatically.
 
 ### Added
 
@@ -142,6 +144,10 @@ with the same order, and no new parameter is required. The behavior changes to p
 - pip install output is no longer written to the debug log (only pip's "Successfully installed" line)
 - `merge_resolved_packages()` is kept for backward compatibility but the resolver no longer uses it
 
+### Removed
+
+- Python 3.8 support. Supported versions are 3.9 to 3.14 (3.13 and 3.14 are now tested in CI).
+
 ### Fixed
 
 - **Critical:** a failed resolution was cached as a success (`{}` packages with the new hash), so the
@@ -177,6 +183,13 @@ with the same order, and no new parameter is required. The behavior changes to p
 - The README bundled inside the package described 1.2.0. It is now a short, current guide that links to
   the full documentation.
 - `packaging` is declared as a dependency (it was used but only installed through pip-tools)
+- When an install attempt timed out or failed while pip was replacing a package, pip's `~package` backup
+  folders stayed in site-packages, and every later pip run warned "Ignoring incompletely removed
+  distribution". ChaCC now removes the folders left by its own attempt and reinstalls that batch cleanly
+  (`--force-reinstall --no-deps`) on the retry. Leftovers that were already there are reported once,
+  with their paths, and left alone.
+- Building the package no longer shows setuptools' license deprecation warnings: the license is the SPDX
+  expression `MIT` and the license classifier is gone (requires setuptools 77+ to build)
 - `cdm upgrade PKG` / `cdm upgrade -r FILE` cleared every other module from the cache
 
 ## [1.3.0] - 2026-09-18
