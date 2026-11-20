@@ -21,7 +21,7 @@ from .chacc import (
     install_missing_packages,
 )
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 __author__ = "Jonas G Mwambimbi"
 __email__ = "jonasgeorge1015@gmail.com"
 

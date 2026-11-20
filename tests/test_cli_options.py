@@ -8,6 +8,7 @@ import subprocess
 from unittest.mock import MagicMock, patch
 
 
+from chacc.requirements import pip_path
 from chacc import DependencyManager
 from chacc import installer as installer_module
 from chacc.cli import cmd_check
@@ -121,5 +122,5 @@ def test_relative_paths_in_passed_text_and_cli_files(tmp_path, monkeypatch):
         # cdm -r FILE: relative to the file's folder.
         run_cli(['--cache-dir', cache, 'resolve', '-r', 'svc/reqs.txt'])
     inputs = [list(c['inputs'].values()) for c in runner.compile_calls]
-    assert f"-e {tmp_path / 'plugins' / 'x'}" in inputs[0][0]
-    assert any(f"-e {tmp_path / 'svc' / 'lib'}" in text for text in inputs[1])
+    assert f"-e {pip_path(str(tmp_path / 'plugins' / 'x'))}" in inputs[0][0]
+    assert any(f"-e {pip_path(str(tmp_path / 'svc' / 'lib'))}" in text for text in inputs[1])

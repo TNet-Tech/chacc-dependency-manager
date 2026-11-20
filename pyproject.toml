@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chacc-dependency-manager"
-version = "1.4.0"
+version = "1.4.1"
 description = "Pip accelerator package. Intelligent, incremental dependency resolution and caching for pip environment based applications. It is meant to complement pip"
 authors = [
     {name = "Jonas G Mwambimbi", email = "jonasgeorge1015@gmail.com"}
@@ -130,6 +130,7 @@ ignore_errors = true
 
 [tool.pytest.ini_options]
 minversion = "7.0"
+asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra -q"
 testpaths = [
     "tests",

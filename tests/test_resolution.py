@@ -5,11 +5,13 @@ pip / pip-compile are replaced by fakes (see helpers.py), so no network is neede
 """
 
 import os
+from pathlib import Path
 import subprocess
 from unittest.mock import patch
 
 import pytest
 
+from chacc.requirements import pip_path
 from chacc import ResolutionError
 from chacc import cache as cache_module
 from chacc import installer as installer_module
@@ -63,7 +65,7 @@ def test_all_modules_resolved_in_one_run_with_constraints(cache_dir):
     inputs = runner.compile_calls[0]['inputs']
     assert inputs['m000-a.in'] == "requests\n"
     assert inputs['m001-b.in'] == "idna\n"
-    assert inputs['constraints.in'] == f"-c {core}\n"
+    assert inputs['constraints.in'] == f"-c {pip_path(str(core))}\n"
     assert pins == {'certifi': '==2024.2.2', 'idna': '==3.6', 'requests': '==2.31.0'}
 
     module_caches = dm.load_cache()['requirements_caches']
@@ -176,3 +178,46 @@ def test_environment_hash_tracks_architecture():
     with patch('platform.machine', return_value='aarch64'):
         second = get_environment_hash()
     assert first != second
+
+
+def test_constraint_path_is_written_so_pip_reads_it_exactly(cache_dir, tmp_path):
+    import shlex
+    folder = tmp_path / 'dir with spaces'
+    folder.mkdir()
+    # On Linux/macOS a backslash is a valid file-name character, which mimics a Windows
+    # path; on Windows the real path already has backslashes (and a drive letter).
+    name = r'C:\Users\Jonas\core-constraints.txt' if os.sep == '/' else 'core-constraints.txt'
+    weird = folder / name
+    weird.write_text('requests==2.31.0\n')
+    dm = make_dm(cache_dir, constraint_files=[str(weird)])
+    runner = FakeRunner()
+    with patch.object(subprocess, 'run', runner):
+        dm.resolve_dependencies_sync({'a': 'requests', 'b': 'idna'}, install=False)
+    [line] = runner.compile_calls[0]['inputs']['constraints.in'].splitlines()
+    option, path = shlex.split(line)
+    # Compared as paths: on Windows pip gets forward slashes, which name the same file.
+    assert (option, Path(path)) == ('-c', weird)
+
+
+def test_unreadable_file_is_not_treated_as_a_conflict(cache_dir, tmp_path):
+    constraints = tmp_path / 'core.txt'
+    constraints.write_text('requests==2.31.0\n')
+    dm = make_dm(cache_dir, constraint_files=[str(constraints)])
+    failing = FakeRunner(compile_rc=1, compile_stderr=(
+        "pip._internal.exceptions.InstallationError: Could not open requirements file: "
+        "[Errno 2] No such file or directory: 'C:UsersJonascore.txt'"
+    ))
+    with patch.object(subprocess, 'run', failing):
+        with pytest.raises(ResolutionError, match="could not be opened") as info:
+            dm.resolve_dependencies_sync({'a': 'requests'}, install=False)
+    # The real cause reaches the user, and no per-module fallback ran.
+    assert "C:UsersJonascore.txt" in str(info.value)
+    assert len(failing.compile_calls) == 1
+
+
+def test_summary_keeps_exception_line_when_it_is_the_only_explanation():
+    from chacc.errors import summarize_pip_error
+    only = "pip._internal.exceptions.InstallationError: Could not open requirements file: x"
+    assert "Could not open requirements file" in summarize_pip_error(only)
+    both = "ERROR: Cannot install a and b\npip._internal.exceptions.DistributionNotFound: ResolutionImpossible"
+    assert summarize_pip_error(both) == "ERROR: Cannot install a and b"
