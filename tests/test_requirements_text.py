@@ -5,6 +5,7 @@ pip / pip-compile are replaced by fakes (see helpers.py), so no network is neede
 """
 
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 from chacc.requirements import pip_path
@@ -103,10 +104,13 @@ def test_absolutized_option_paths_are_safe_for_pip(tmp_path):
     (base / 'base.txt').write_text('idna')
     out = absolutize_requirement_paths('-r base.txt  # shared\n-e ./libs/core', str(base))
     first, second = out.splitlines()
-    assert shlex.split(first.split('#')[0]) == ['-r', str(base / 'base.txt')]
+    # Compared as paths: on Windows pip gets forward slashes, which name the same file.
+    option, path = shlex.split(first.split('#')[0])
+    assert (option, Path(path)) == ('-r', base / 'base.txt')
     assert first.endswith('  # shared')
-    assert shlex.split(second) == ['-e', str(base / 'libs' / 'core')]
+    option, path = shlex.split(second)
+    assert (option, Path(path)) == ('-e', base / 'libs' / 'core')
     # The quoted path is still found when tracking included files.
-    assert included_files(out) == [str(base / 'base.txt')]
+    assert [Path(p) for p in included_files(out)] == [base / 'base.txt']
     # Running it again leaves already-absolute, quoted paths as they are.
     assert absolutize_requirement_paths(out, str(tmp_path)) == out

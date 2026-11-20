@@ -5,6 +5,7 @@ pip / pip-compile are replaced by fakes (see helpers.py), so no network is neede
 """
 
 import os
+from pathlib import Path
 import subprocess
 from unittest.mock import patch
 
@@ -193,7 +194,9 @@ def test_constraint_path_is_written_so_pip_reads_it_exactly(cache_dir, tmp_path)
     with patch.object(subprocess, 'run', runner):
         dm.resolve_dependencies_sync({'a': 'requests', 'b': 'idna'}, install=False)
     [line] = runner.compile_calls[0]['inputs']['constraints.in'].splitlines()
-    assert shlex.split(line) == ['-c', str(weird)]
+    option, path = shlex.split(line)
+    # Compared as paths: on Windows pip gets forward slashes, which name the same file.
+    assert (option, Path(path)) == ('-c', weird)
 
 
 def test_unreadable_file_is_not_treated_as_a_conflict(cache_dir, tmp_path):
