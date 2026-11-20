@@ -4,10 +4,10 @@ Parsing requirements text and pip-compile output.
 pip / pip-compile are replaced by fakes (see helpers.py), so no network is needed.
 """
 
-from unittest.mock import patch
 import os
+from unittest.mock import patch
 
-
+from chacc.requirements import pip_path
 from chacc.utils import attribute_packages, parse_lock_file
 from helpers import (
     LOCK_A_B,
@@ -48,12 +48,20 @@ def test_absolutize_requirement_paths(tmp_path):
         "--index-url https://example.com/simple",
     ])
     out = absolutize_requirement_paths(text, base).splitlines()
-    assert out[0] == f"-r {os.path.join(base, 'base.txt')}"
-    assert out[1] == f"--requirement={os.path.normpath(os.path.join(base, '../shared/reqs.txt'))}  # shared"
-    assert out[2] == f"-c {os.path.join(base, 'constraints.txt')}"
-    assert out[3] == f"-e {os.path.join(base, 'libs/core')}"
-    assert out[4] == os.path.join(base, 'libs/plugin[extra]')
-    assert out[5:] == text.splitlines()[5:]
+
+    def at(relative):
+        return os.path.normpath(os.path.join(base, relative))
+
+    # Option lines are written the way pip reads them (forward slashes, quoted if needed).
+    assert out[0] == f"-r {pip_path(at('base.txt'))}"
+    assert out[1] == f"--requirement={pip_path(at('../shared/reqs.txt'))}  # shared"
+    assert out[2] == f"-c {pip_path(at('constraints.txt'))}"
+    assert out[3] == f"-e {pip_path(at('libs/core'))}"
+    assert out[4] == at('libs/plugin[extra]')
+    assert out[5] == text.splitlines()[5]  # VCS link untouched
+    # An absolute path stays the same file (on Windows it gains the current drive letter).
+    assert out[6] == f"-r {pip_path(at('/abs/other.txt'))}"
+    assert out[7:] == text.splitlines()[7:]
 
 
 def test_packages_from_included_files_are_credited_to_the_including_modules(tmp_path, monkeypatch):

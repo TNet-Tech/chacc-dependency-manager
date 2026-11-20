@@ -466,6 +466,10 @@ Module-level helpers mirror these and accept `config=`: `re_resolve_dependencies
 
 Resolution failures raise `chacc.ResolutionError` (with `.conflicts` and `.module`). pip install failures (after all retries) raise `subprocess.CalledProcessError`.
 
+## Recent Updates (v1.4.1)
+
+A patch release for Windows. In 1.4.0, resolving failed on Windows whenever a constraint file was used, with a misleading "no differing versions were found to reconcile" error, because pip dropped the backslashes in the file's path. Paths ChaCC gives pip (constraint files, and `-r`/`-c`/`-e` includes) are now written with forward slashes and quoted, so they work on Windows and with spaces. A file pip can't open is now reported as such. See [RELEASE_NOTES_v1.4.1.md](RELEASE_NOTES_v1.4.1.md).
+
 ## Recent Updates (v1.4.0)
 
 This release fixes how packages are resolved, cached and installed. See [CHANGELOG.md](CHANGELOG.md) for the full list.

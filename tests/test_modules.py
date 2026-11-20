@@ -8,6 +8,7 @@ import subprocess
 from unittest.mock import patch
 
 
+from chacc.requirements import pip_path
 from chacc import installer as installer_module
 from helpers import (
     FakeRunner, lock_for, make_dm, versions_runner,
@@ -98,7 +99,7 @@ def test_included_files_are_resolved_from_the_file_and_tracked(cache_dir, tmp_pa
     with patch.object(subprocess, 'run', runner):
         dm.resolve_dependencies_sync(search_dirs=[str(tmp_path / 'api')], install=False)
         [module_input] = runner.compile_calls[0]['inputs'].values()
-        assert f"-r {tmp_path / 'base.txt'}" in module_input
+        assert f"-r {pip_path(str(tmp_path / 'base.txt'))}" in module_input
 
         dm.resolve_dependencies_sync(search_dirs=[str(tmp_path / 'api')], install=False)
         assert len(runner.compile_calls) == 1  # unchanged: cache hit

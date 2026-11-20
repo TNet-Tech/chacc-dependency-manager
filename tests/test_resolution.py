@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
+from chacc.requirements import pip_path
 from chacc import ResolutionError
 from chacc import cache as cache_module
 from chacc import installer as installer_module
@@ -63,7 +64,7 @@ def test_all_modules_resolved_in_one_run_with_constraints(cache_dir):
     inputs = runner.compile_calls[0]['inputs']
     assert inputs['m000-a.in'] == "requests\n"
     assert inputs['m001-b.in'] == "idna\n"
-    assert inputs['constraints.in'] == f"-c {core}\n"
+    assert inputs['constraints.in'] == f"-c {pip_path(str(core))}\n"
     assert pins == {'certifi': '==2024.2.2', 'idna': '==3.6', 'requests': '==2.31.0'}
 
     module_caches = dm.load_cache()['requirements_caches']
@@ -180,8 +181,12 @@ def test_environment_hash_tracks_architecture():
 
 def test_constraint_path_is_written_so_pip_reads_it_exactly(cache_dir, tmp_path):
     import shlex
-    weird = tmp_path / 'dir with spaces' / r'C:\Users\Jonas\core-constraints.txt'
-    weird.parent.mkdir()
+    folder = tmp_path / 'dir with spaces'
+    folder.mkdir()
+    # On Linux/macOS a backslash is a valid file-name character, which mimics a Windows
+    # path; on Windows the real path already has backslashes (and a drive letter).
+    name = r'C:\Users\Jonas\core-constraints.txt' if os.sep == '/' else 'core-constraints.txt'
+    weird = folder / name
     weird.write_text('requests==2.31.0\n')
     dm = make_dm(cache_dir, constraint_files=[str(weird)])
     runner = FakeRunner()
