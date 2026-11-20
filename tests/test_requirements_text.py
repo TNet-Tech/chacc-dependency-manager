@@ -4,6 +4,7 @@ Parsing requirements text and pip-compile output.
 pip / pip-compile are replaced by fakes (see helpers.py), so no network is needed.
 """
 
+from unittest.mock import patch
 import os
 
 
@@ -71,3 +72,33 @@ def test_packages_from_included_files_are_credited_to_the_including_modules(tmp_
         'api': {'idna': '==3.8', 'six': '==1.17.0'},
         'web': {'click': '==8.1.0', 'idna': '==3.8'},
     }
+
+
+def test_pip_path_survives_pips_shlex_parsing_on_windows_and_with_spaces():
+    import shlex
+    from pathlib import PureWindowsPath
+    from chacc import requirements as requirements_module
+    from chacc.requirements import pip_path
+
+    with patch.object(requirements_module, 'PurePath', PureWindowsPath):
+        windows = pip_path(r"C:\Users\Jonas\apicon\.chacc_cache\core-constraints.txt")
+    # pip reads "-c <path>" with shlex.split; the backslashes must not be eaten.
+    assert shlex.split(f"-c {windows}") == ['-c', 'C:/Users/Jonas/apicon/.chacc_cache/core-constraints.txt']
+    assert shlex.split(f"-r {pip_path('/srv/my app/base.txt')}") == ['-r', '/srv/my app/base.txt']
+
+
+def test_absolutized_option_paths_are_safe_for_pip(tmp_path):
+    import shlex
+    from chacc.utils import absolutize_requirement_paths, included_files
+    base = tmp_path / 'my project'
+    base.mkdir()
+    (base / 'base.txt').write_text('idna')
+    out = absolutize_requirement_paths('-r base.txt  # shared\n-e ./libs/core', str(base))
+    first, second = out.splitlines()
+    assert shlex.split(first.split('#')[0]) == ['-r', str(base / 'base.txt')]
+    assert first.endswith('  # shared')
+    assert shlex.split(second) == ['-e', str(base / 'libs' / 'core')]
+    # The quoted path is still found when tracking included files.
+    assert included_files(out) == [str(base / 'base.txt')]
+    # Running it again leaves already-absolute, quoted paths as they are.
+    assert absolutize_requirement_paths(out, str(tmp_path)) == out

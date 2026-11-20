@@ -12,8 +12,10 @@ import tempfile
 import time
 from typing import Dict, List, Optional, Tuple
 
-from .errors import NETWORK_ERROR_MARKERS, ResolutionError, not_a_conflict, summarize_pip_error
-from .requirements import attribute_packages, included_files, parse_lock_file
+from .errors import (
+    FILE_ERROR_MARKERS, NETWORK_ERROR_MARKERS, ResolutionError, not_a_conflict, summarize_pip_error,
+)
+from .requirements import attribute_packages, included_files, parse_lock_file, pip_path
 
 Pins = Dict[str, str]
 
@@ -115,7 +117,7 @@ def _write_inputs(
         constraints_path = os.path.join(work_dir, "constraints.in")
         with open(constraints_path, 'w') as f:
             for constraint in constraint_files:
-                f.write(f"-c {constraint}\n")
+                f.write(f"-c {pip_path(constraint)}\n")
         input_paths.append(constraints_path)
     return module_files, input_paths
 
@@ -137,6 +139,11 @@ def _run(cmd: List[str], timeout: Optional[int], action: str, names: str, upgrad
     raw = result.stderr or result.stdout or "unknown error"
     details = summarize_pip_error(raw)
     verb = "upgrade" if upgrade else "resolve"
+    if any(marker in raw for marker in FILE_ERROR_MARKERS):
+        raise not_a_conflict(
+            f"Failed to {verb} dependencies for [{names}]: a requirements or constraints file "
+            f"could not be opened (not a dependency conflict). Check that the path exists.\n{details}"
+        )
     if any(marker in raw for marker in NETWORK_ERROR_MARKERS):
         raise not_a_conflict(
             f"Failed to {verb} dependencies for [{names}]: the package index could not be "

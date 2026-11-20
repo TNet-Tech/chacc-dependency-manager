@@ -182,6 +182,15 @@ with the same order, and no new parameter is required. The behavior changes to p
   the requirements file (or the current folder for text passed from Python), as pip does.
 - Editing a file included with `-r` / `-c` didn't trigger a new resolve. Included files now count toward
   the module's hash.
+- **Windows:** resolving failed whenever constraint files were used, with the misleading error "Modules
+  resolve individually but not together, and no differing versions were found to reconcile". pip reads
+  `-c`/`-r`/`-e` lines with `shlex`, which drops the backslashes in Windows paths, so pip looked for a file
+  like `C:UsersJonas…core-constraints.txt`. ChaCC now writes these paths with forward slashes and quotes
+  them, so they also work with spaces. Include paths inside requirements files had the same problem and are
+  fixed too.
+- A requirements or constraints file pip can't open is reported as such, instead of starting the
+  per-module conflict check. pip's own explanation is kept in the message when it's the only one, and
+  the conflict check's final error includes the original error.
 - Packages that come from a file included with `-r` are credited to the module that includes it (they
   were missing from that module's package list, which the conflict fallback reuses)
 - Under the CLI, every log line was printed twice, and debug messages showed without `-v`

@@ -8,6 +8,8 @@ Reading requirements text and pip-compile output.
 
 import os
 import re
+import shlex
+from pathlib import PurePath
 from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -43,9 +45,31 @@ _PATH_OPTIONS = ('-r', '--requirement', '-c', '--constraint', '-e', '--editable'
 _INCLUDE_OPTIONS = ('-r', '--requirement', '-c', '--constraint')
 
 
-def _is_local_relative(target: str) -> bool:
-    return bool(target) and '://' not in target and not os.path.isabs(target) and \
+def pip_path(path: str) -> str:
+    """
+    A local path written the way pip reads it on an option line (``-r``/``-c``/``-e``).
+
+    pip splits option lines with ``shlex``, which treats ``\\`` as an escape character and
+    splits on spaces. So a Windows path like ``C:\\Users\\me\\core.txt`` would turn into
+    ``C:Usersmecore.txt``. Forward slashes (which Windows accepts) and shell quoting
+    keep the path intact on every platform.
+    """
+    return shlex.quote(PurePath(path).as_posix())
+
+
+def _is_local_path(target: str) -> bool:
+    return bool(target) and '://' not in target and \
         not target.startswith(('git+', 'hg+', 'svn+', 'bzr+', 'file:'))
+
+
+def _option_target(rest: str) -> Tuple[str, str]:
+    """``"'/a b/x.txt'  # note"`` -> ``("/a b/x.txt", "  # note")``: the path, and what follows it."""
+    if rest[:1] in ('"', "'"):
+        end = rest.find(rest[0], 1)
+        if end != -1:
+            return rest[1:end], rest[end + 1:]
+    target = rest.split()[0] if rest.split() else ''
+    return target, rest[len(target):]
 
 
 def _split_option(line: str) -> Optional[Tuple[str, str, str]]:
@@ -67,7 +91,8 @@ def absolutize_requirement_paths(requirements_content: str, base_dir: str) -> st
     ``-c constraints.txt``, ``-e ./libs/x`` or a bare ``./libs/x`` would otherwise point
     at the wrong place. Paths are resolved the way pip resolves them inside a
     requirements file: relative to the file's own folder. URLs, VCS links and absolute
-    paths are left alone.
+    paths are left alone. Paths on option lines are written with :func:`pip_path`, so
+    they also work on Windows and with spaces.
     """
     base_dir = os.path.abspath(base_dir)
     lines = []
@@ -76,10 +101,10 @@ def absolutize_requirement_paths(requirements_content: str, base_dir: str) -> st
         option = _split_option(stripped)
         if option is not None:
             name, sep, rest = option
-            target = rest.split()[0] if rest.split() else ''
-            if _is_local_relative(target):
+            target, tail = _option_target(rest)
+            if _is_local_path(target):
                 absolute = os.path.normpath(os.path.join(base_dir, target))
-                raw = f"{name}{sep}{absolute}{rest[len(target):]}"
+                raw = f"{name}{sep}{pip_path(absolute)}{tail}"
         elif stripped.startswith(('./', '../', '.\\', '..\\')) or stripped in ('.', '..'):
             target, _, tail = stripped.partition(' ')
             raw = os.path.normpath(os.path.join(base_dir, target)) + (f" {tail}" if tail else "")
@@ -102,7 +127,7 @@ def included_files(requirements_content: str, base_dir: Optional[str] = None) ->
             option = _split_option(raw.strip())
             if option is None or option[0] not in _INCLUDE_OPTIONS:
                 continue
-            target = option[2].split()[0] if option[2].split() else ''
+            target, _ = _option_target(option[2])
             if not target or '://' in target:
                 continue
             path = os.path.normpath(os.path.join(folder, target))

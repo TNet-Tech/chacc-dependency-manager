@@ -96,9 +96,12 @@ class Resolver:
                 raise
             if len(non_empty) < 2 and not self.constraint_files:
                 raise
+            original_error = combined_error
+            reason = _first_pip_error(str(combined_error))
             self.logger.warning(
-                "Modules cannot all be satisfied together; resolving each module on its own "
-                "to find the conflict..."
+                "Modules cannot all be satisfied together"
+                + (f" ({reason})" if reason else "")
+                + "; resolving each module on its own to find the conflict..."
             )
             self.logger.debug(str(combined_error))
 
@@ -114,7 +117,7 @@ class Resolver:
             per_module[name] = pins_for_module
             module_pins.append((name, pins_for_module))
 
-        merged, conflicts = self._merge(module_pins)
+        merged, conflicts = self._merge(module_pins, original_error)
         if self.on_conflict == ON_CONFLICT_FAIL:
             raise ResolutionError(
                 "Conflicting module dependencies:\n" + "\n".join(f"  - {format_conflict(c)}" for c in conflicts),
@@ -171,8 +174,7 @@ class Resolver:
             except Exception as e:
                 self.logger.warning(f"Post-resolve hook failed: {e}")
 
-    
-    def _merge(self, module_pins: List[Tuple[str, Pins]]) -> Tuple[Pins, List[Dict]]:
+    def _merge(self, module_pins: List[Tuple[str, Pins]], original_error: ResolutionError) -> Tuple[Pins, List[Dict]]:
         """Apply the version policy (core constraints first, so they win) and log each conflict."""
         core_pins = self._constraint_pins()
         if core_pins:
@@ -185,7 +187,7 @@ class Resolver:
         if not conflicts:
             raise ResolutionError(
                 "Modules resolve individually but not together, and no differing versions were "
-                "found to reconcile. Check the constraint files."
+                f"found to reconcile. Check the constraint files. The original error was:\n{original_error}"
             )
         for conflict in conflicts:
             major = conflict['kind'] == 'major'
@@ -231,3 +233,11 @@ def _enforce_core_pins(merged: Pins, conflicts: List[Dict]):
         for name in list(merged):
             if canonicalize_name(base_package_name(name)) == canonicalize_name(conflict['package']):
                 merged[name] = f"=={core_version}"
+
+
+def _first_pip_error(message: str) -> str:
+    """The first ``ERROR:`` line of a pip message, without the prefix (empty if there is none)."""
+    for line in message.splitlines():
+        if line.startswith("ERROR:"):
+            return line[len("ERROR:"):].strip()
+    return ""
